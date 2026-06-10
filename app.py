@@ -167,6 +167,20 @@ def _pdf_worker(job_id: str, links: list[str], q: queue.Queue) -> None:
                             display: none !important;
                         }
 
+                        /* Hide all images, icons, and decorative visuals */
+                        img, svg, video, audio, canvas,
+                        [class*="icon"], [class*="logo"], [class*="banner"],
+                        [class*="hero"], [class*="thumbnail"], [class*="carousel"],
+                        [class*="slider"], [class*="gallery"], [class*="image"],
+                        picture, figure, iframe {
+                            display: none !important;
+                        }
+
+                        /* Strip background images but keep background colors for structure */
+                        * {
+                            background-image: none !important;
+                        }
+
                         /* Unpin only fixed/sticky elements so they don't
                            repeat or cover content on pages 2+ */
                         [style*="position: fixed"], [style*="position:fixed"],
@@ -175,7 +189,7 @@ def _pdf_worker(job_id: str, links: list[str], q: queue.Queue) -> None:
                         }
 
                         /* Prevent content being clipped mid-element at page breaks */
-                        p, h1, h2, h3, h4, h5, h6, img, table, li, blockquote {
+                        p, h1, h2, h3, h4, h5, h6, table, li, blockquote {
                             page-break-inside: avoid;
                             break-inside: avoid;
                         }
