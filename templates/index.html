@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Page → PDF</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, sans-serif; background: #f4f5f7; color: #1a1a2e; min-height: 100vh; display: flex; flex-direction: column; align-items: center; padding: 48px 16px; }
+    h1 { font-size: 1.6rem; font-weight: 700; margin-bottom: 6px; }
+    .subtitle { color: #6b7280; font-size: 0.9rem; margin-bottom: 32px; }
+    .card { background: #fff; border-radius: 12px; box-shadow: 0 2px 16px rgba(0,0,0,.08); padding: 28px; width: 100%; max-width: 720px; margin-bottom: 20px; }
+    .input-row { display: flex; gap: 10px; }
+    input[type="url"] { flex: 1; padding: 10px 14px; border: 1.5px solid #d1d5db; border-radius: 8px; font-size: 0.95rem; outline: none; transition: border-color .2s; }
+    input[type="url"]:focus { border-color: #4f46e5; }
+    button { padding: 10px 20px; border: none; border-radius: 8px; font-size: 0.95rem; font-weight: 600; cursor: pointer; transition: background .2s, opacity .2s; }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+    .btn-primary { background: #4f46e5; color: #fff; }
+    .btn-primary:hover:not(:disabled) { background: #4338ca; }
+    .btn-green { background: #16a34a; color: #fff; }
+    .btn-green:hover:not(:disabled) { background: #15803d; }
+    .btn-dl { background: #0369a1; color: #fff; }
+    .btn-dl:hover { background: #0284c7; }
+    .section-label { font-size: 0.78rem; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: #6b7280; margin-bottom: 12px; }
+    .link-list { list-style: none; max-height: 320px; overflow-y: auto; border: 1.5px solid #e5e7eb; border-radius: 8px; }
+    .link-list li { padding: 9px 14px; font-size: 0.85rem; border-bottom: 1px solid #f3f4f6; color: #374151; word-break: break-all; }
+    .link-list li:last-child { border-bottom: none; }
+    .link-list li.done { color: #16a34a; }
+    .link-list li.done::before { content: "✓  "; }
+    .link-list li.already { color: #9ca3af; }
+    .link-list li.already::before { content: "⟳  "; }
+    .link-list li.fail { color: #dc2626; }
+    .link-list li.fail::before { content: "✗  "; }
+    .link-list li.active { color: #4f46e5; font-weight: 600; }
+    .link-list li.skipped { color: #9ca3af; }
+    .link-list li.skipped::before { content: "–  "; }
+    .badge { display: inline-block; font-size: 0.7rem; font-weight: 700; padding: 1px 6px; border-radius: 4px; margin-left: 6px; vertical-align: middle; }
+    .badge-new { background: #e0e7ff; color: #4f46e5; }
+    .badge-done { background: #dcfce7; color: #16a34a; }
+    .progress-bar-wrap { background: #e5e7eb; border-radius: 99px; height: 10px; margin: 14px 0; overflow: hidden; }
+    .progress-bar { height: 100%; background: #4f46e5; border-radius: 99px; width: 0%; transition: width .3s; }
+    .actions { display: flex; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
+    #status-msg { font-size: 0.85rem; color: #6b7280; margin-top: 10px; min-height: 1.2em; }
+    .hidden { display: none !important; }
+    #spinner { display: inline-block; width: 16px; height: 16px; border: 2px solid #c7d2fe; border-top-color: #4f46e5; border-radius: 50%; animation: spin .7s linear infinite; vertical-align: middle; margin-right: 6px; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <h1>Page → PDF Downloader</h1>
+  <p class="subtitle">Paste a URL — scrape its sublinks — download all as PDFs</p>
+
+  <!-- Step 1: URL input -->
+  <div class="card">
+    <div class="section-label">Enter a page URL</div>
+    <div class="input-row">
+      <input type="url" id="url-input" placeholder="https://example.edu/some/section/" />
+      <button class="btn-primary" id="scrape-btn" onclick="scrapeLinks()">Find Sublinks</button>
+    </div>
+    <div id="status-msg"></div>
+    <div style="margin-top:12px; font-size:0.78rem;">
+      <button style="background:#f3f4f6; color:#374151; padding:6px 12px; border-radius:6px; border:1px solid #e5e7eb; cursor:pointer; font-size:0.78rem;" onclick="clearManifest()">🗑 Clear Cache</button>
+      <span id="cache-status" style="margin-left:8px; color:#9ca3af;"></span>
+    </div>
+  </div>
+
+  <!-- Step 2: Link list + download button -->
+  <div class="card hidden" id="links-card">
+    <div class="section-label" id="links-label">Found 0 links</div>
+    <ul class="link-list" id="link-list"></ul>
+    <div class="actions" style="margin-top:16px; align-items:center;">
+      <button class="btn-green" id="download-btn" onclick="startDownload()">⬇ Download New as PDFs</button>
+      <span id="links-summary" style="font-size:0.83rem; color:#6b7280;"></span>
+    </div>
+  </div>
+
+  <!-- Step 3: Progress -->
+  <div class="card hidden" id="progress-card">
+    <div class="section-label" id="progress-label">Generating PDFs…</div>
+    <div class="progress-bar-wrap"><div class="progress-bar" id="progress-bar"></div></div>
+    <ul class="link-list" id="progress-list"></ul>
+    <div class="actions">
+      <a id="dl-zip-btn" class="hidden"><button class="btn-dl">⬇ Download ZIP</button></a>
+    </div>
+  </div>
+
+  <script>
+    let scrapedLinks = [];   // array of {url, done, file, scraped_at}
+    let scrapeJobId = null;
+
+    function setStatus(msg, spin = false) {
+      const el = document.getElementById('status-msg');
+      el.innerHTML = spin ? `<span id="spinner"></span>${msg}` : msg;
+    }
+
+    async function scrapeLinks() {
+      const url = document.getElementById('url-input').value.trim();
+      if (!url) { setStatus('Please enter a URL.'); return; }
+
+      const btn = document.getElementById('scrape-btn');
+      btn.disabled = true;
+      document.getElementById('links-card').classList.add('hidden');
+      document.getElementById('progress-card').classList.add('hidden');
+      setStatus('Starting crawler…', true);
+
+      try {
+        const res = await fetch('/scrape', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url })
+        });
+        const data = await res.json();
+        if (data.error) { setStatus('Error: ' + data.error); btn.disabled = false; return; }
+
+        scrapeJobId = data.job_id;
+        listenToScrapeProgress(scrapeJobId);
+      } catch (e) {
+        setStatus('Request failed: ' + e.message);
+        btn.disabled = false;
+      }
+    }
+
+    function listenToScrapeProgress(jobId) {
+      const es = new EventSource(`/progress/${jobId}`);
+      let crawlCount = 0;
+
+      es.onmessage = (e) => {
+        const evt = JSON.parse(e.data);
+
+        if (evt.type === 'crawling') {
+          crawlCount = evt.count;
+          setStatus(`Crawling… found ${crawlCount} page${crawlCount !== 1 ? 's' : ''} so far.`, true);
+        }
+
+        if (evt.type === 'complete') {
+          scrapedLinks = evt.links;
+          const newCount = scrapedLinks.filter(l => !l.done).length;
+          const doneCount = scrapedLinks.length - newCount;
+          setStatus(`Found ${scrapedLinks.length} page${scrapedLinks.length !== 1 ? 's' : ''}.`);
+          renderLinkList(newCount, doneCount);
+          document.getElementById('scrape-btn').disabled = false;
+          es.close();
+        }
+
+        if (evt.type === 'fatal') {
+          setStatus('Error: ' + evt.reason);
+          document.getElementById('scrape-btn').disabled = false;
+          es.close();
+        }
+      };
+
+      es.onerror = () => {
+        setStatus('Connection lost.');
+        document.getElementById('scrape-btn').disabled = false;
+        es.close();
+      };
+    }
+
+    function renderLinkList(newCount, doneCount) {
+      const list = document.getElementById('link-list');
+      document.getElementById('links-label').textContent =
+        `Found ${scrapedLinks.length} sublinks`;
+
+      list.innerHTML = scrapedLinks.map(l => {
+        if (l.done) {
+          return `<li class="already" title="Saved as: ${l.file} on ${l.scraped_at}">
+            ${l.url} <span class="badge badge-done">already downloaded</span></li>`;
+        }
+        return `<li>${l.url} <span class="badge badge-new">new</span></li>`;
+      }).join('');
+
+      const summary = doneCount > 0
+        ? `${newCount} new · ${doneCount} already downloaded (will be skipped)`
+        : `${newCount} new`;
+      document.getElementById('links-summary').textContent = summary;
+
+      const downloadBtn = document.getElementById('download-btn');
+      downloadBtn.disabled = newCount === 0;
+      downloadBtn.textContent = newCount > 0
+        ? `⬇ Download ${newCount} New as PDFs`
+        : '✓ All pages already downloaded';
+
+      document.getElementById('links-card').classList.remove('hidden');
+    }
+
+    async function startDownload() {
+      const newLinks = scrapedLinks.filter(l => !l.done).map(l => l.url);
+      if (!newLinks.length) return;
+      document.getElementById('download-btn').disabled = true;
+
+      const progCard = document.getElementById('progress-card');
+      progCard.classList.remove('hidden');
+      document.getElementById('progress-list').innerHTML = '';
+      document.getElementById('progress-bar').style.width = '0%';
+      document.getElementById('progress-label').textContent = 'Generating PDFs…';
+      document.getElementById('dl-zip-btn').classList.add('hidden');
+
+      const res = await fetch('/start-download', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ links: newLinks })
+      });
+      const { job_id } = await res.json();
+
+      const es = new EventSource(`/progress/${job_id}`);
+      const progList = document.getElementById('progress-list');
+      const bar = document.getElementById('progress-bar');
+      const items = {};
+
+      es.onmessage = (e) => {
+        const evt = JSON.parse(e.data);
+
+        if (evt.type === 'progress') {
+          const pct = Math.round((evt.current - 1) / evt.total * 100);
+          bar.style.width = pct + '%';
+          document.getElementById('progress-label').textContent =
+            `Generating PDF ${evt.current} of ${evt.total}…`;
+          const li = document.createElement('li');
+          li.textContent = evt.url;
+          li.classList.add('active');
+          progList.appendChild(li);
+          li.scrollIntoView({ block: 'nearest' });
+          items[evt.url] = li;
+        }
+
+        if (evt.type === 'skipped') {
+          const li = document.createElement('li');
+          li.classList.add('skipped');
+          li.textContent = `${evt.file}  (already downloaded)`;
+          progList.appendChild(li);
+        }
+
+        if (evt.type === 'done_one') {
+          const li = items[evt.url];
+          if (li) {
+            li.classList.remove('active');
+            li.classList.add('done');
+            li.textContent = `${evt.file}  (${evt.size_kb} KB)`;
+          }
+        }
+
+        if (evt.type === 'error_one') {
+          const li = items[evt.url];
+          if (li) {
+            li.classList.remove('active');
+            li.classList.add('fail');
+            li.textContent = `${evt.url} — ${evt.reason}`;
+          }
+        }
+
+        if (evt.type === 'status') {
+          document.getElementById('progress-label').textContent = evt.message;
+        }
+
+        if (evt.type === 'complete') {
+          bar.style.width = '100%';
+          document.getElementById('progress-label').textContent = 'All PDFs ready! Download below ↓';
+          const dlBtn = document.getElementById('dl-zip-btn');
+          dlBtn.href = `/get-zip/${job_id}`;
+          dlBtn.classList.remove('hidden');
+          es.close();
+          document.getElementById('download-btn').disabled = false;
+        }
+
+        if (evt.type === 'fatal') {
+          document.getElementById('progress-label').textContent = 'Error: ' + evt.reason;
+          es.close();
+          document.getElementById('download-btn').disabled = false;
+        }
+      };
+    }
+
+    document.getElementById('url-input').addEventListener('keydown', e => {
+      if (e.key === 'Enter') scrapeLinks();
+    });
+
+    async function clearManifest() {
+      if (!confirm('Clear the download cache? You will re-download all pages.')) return;
+      try {
+        const res = await fetch('/clear-manifest', { method: 'POST' });
+        const data = await res.json();
+        if (data.status === 'cleared') {
+          document.getElementById('cache-status').textContent = 'Cache cleared ✓';
+          setTimeout(() => { document.getElementById('cache-status').textContent = ''; }, 3000);
+        }
+      } catch (e) {
+        alert('Failed to clear cache: ' + e.message);
+      }
+    }
+  </script>
+</body>
+</html>
