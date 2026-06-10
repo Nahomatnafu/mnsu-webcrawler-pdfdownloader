@@ -33,6 +33,7 @@ ENV/
 
 # Project-specific
 mankato_pdfs/
+crawl_cache/
 *.pdf
 pages.zip
 manifest.json

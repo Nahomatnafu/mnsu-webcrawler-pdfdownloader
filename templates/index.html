@@ -127,6 +127,10 @@
       es.onmessage = (e) => {
         const evt = JSON.parse(e.data);
 
+        if (evt.type === 'using_cache') {
+          setStatus(`✓ Loaded ${evt.count} cached links (no crawl needed)!`, false);
+        }
+
         if (evt.type === 'crawling') {
           crawlCount = evt.count;
           setStatus(`Crawling… found ${crawlCount} page${crawlCount !== 1 ? 's' : ''} so far.`, true);

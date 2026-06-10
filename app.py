@@ -18,6 +18,7 @@ jobs: dict = {}          # job_id -> {"type": "scrape"|"download", "queue": Queu
 
 OUTPUT_DIR = Path("mankato_pdfs")
 MANIFEST_PATH = OUTPUT_DIR / "manifest.json"
+CRAWL_CACHE_DIR = Path("crawl_cache")  # Cache crawl results by starting URL
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -56,6 +57,33 @@ def save_manifest(manifest: dict) -> None:
         json.dump(list(manifest.values()), f, indent=2)
 
 
+def get_crawl_cache_path(start_url: str) -> Path:
+    """Get the cache file path for a given starting URL (keyed by URL hash)."""
+    import hashlib
+    url_hash = hashlib.md5(start_url.encode()).hexdigest()[:8]
+    CRAWL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    return CRAWL_CACHE_DIR / f"crawl_{url_hash}.json"
+
+
+def load_crawl_cache(start_url: str) -> list | None:
+    """Load cached crawl results for this URL, if they exist."""
+    cache_path = get_crawl_cache_path(start_url)
+    if cache_path.exists():
+        try:
+            with open(cache_path) as f:
+                return json.load(f)
+        except Exception:
+            return None
+    return None
+
+
+def save_crawl_cache(start_url: str, links: list) -> None:
+    """Save crawl results to cache."""
+    cache_path = get_crawl_cache_path(start_url)
+    with open(cache_path, "w") as f:
+        json.dump(links, f, indent=2)
+
+
 def _extract_sublinks(page, start_url: str, base: str, domain: str) -> set[str]:
     """Extract all sublinks from the current page that are within base path."""
     found = set()
@@ -73,8 +101,26 @@ def _extract_sublinks(page, start_url: str, base: str, domain: str) -> set[str]:
 
 
 def _scrape_worker(job_id: str, start_url: str, q: queue.Queue, max_pages: int = 100) -> None:
-    """Background thread: crawl all sublinks under start_url."""
+    """Background thread: crawl all sublinks under start_url (with caching)."""
     try:
+        # Check if we have cached crawl results for this URL
+        cached_links = load_crawl_cache(start_url)
+        if cached_links:
+            q.put({"type": "using_cache", "count": len(cached_links)})
+            manifest = load_manifest()
+            links_with_status = [
+                {
+                    "url": l,
+                    "done": l in manifest,
+                    "file": manifest[l]["file"] if l in manifest else None,
+                    "scraped_at": manifest[l]["scraped_at"] if l in manifest else None,
+                }
+                for l in cached_links
+            ]
+            q.put({"type": "complete", "links": links_with_status})
+            return
+
+        # No cache — crawl normally
         p0 = urlparse(start_url)
         base = p0.path.rstrip("/")
         domain = p0.netloc
@@ -111,6 +157,10 @@ def _scrape_worker(job_id: str, start_url: str, q: queue.Queue, max_pages: int =
             finally:
                 browser.close()
 
+        # Save crawl results to cache
+        all_found_sorted = sorted(all_found)
+        save_crawl_cache(start_url, all_found_sorted)
+
         manifest = load_manifest()
         links_with_status = [
             {
@@ -119,7 +169,7 @@ def _scrape_worker(job_id: str, start_url: str, q: queue.Queue, max_pages: int =
                 "file": manifest[l]["file"] if l in manifest else None,
                 "scraped_at": manifest[l]["scraped_at"] if l in manifest else None,
             }
-            for l in sorted(all_found)
+            for l in all_found_sorted
         ]
         q.put({"type": "complete", "links": links_with_status})
     except Exception as e:
