@@ -152,10 +152,38 @@ def _pdf_worker(job_id: str, links: list[str], q: queue.Queue) -> None:
                 out.parent.mkdir(parents=True, exist_ok=True)
 
                 try:
-                    page.emulate_media(media="print")
+                    # Use screen media so the page renders like a real browser
+                    page.emulate_media(media="screen")
                     page.goto(url, wait_until="networkidle", timeout=30_000)
+                    page.wait_for_timeout(500)
+
+                    # Surgically remove only elements known to break multi-page PDFs.
+                    # DO NOT use * { position: static } — it collapses the entire layout.
+                    page.add_style_tag(content="""
+                        /* Hide chrome elements that don't belong in a PDF */
+                        header, nav, .nav, .navbar, .site-header,
+                        footer, .footer, .site-footer,
+                        .cookie-banner, .chat-widget, [class*="overlay"] {
+                            display: none !important;
+                        }
+
+                        /* Unpin only fixed/sticky elements so they don't
+                           repeat or cover content on pages 2+ */
+                        [style*="position: fixed"], [style*="position:fixed"],
+                        [style*="position: sticky"], [style*="position:sticky"] {
+                            position: static !important;
+                        }
+
+                        /* Prevent content being clipped mid-element at page breaks */
+                        p, h1, h2, h3, h4, h5, h6, img, table, li, blockquote {
+                            page-break-inside: avoid;
+                            break-inside: avoid;
+                        }
+                    """)
+
                     page.pdf(
-                        path=str(out), format="A4", print_background=False,
+                        path=str(out), format="A4", print_background=True,
+                        scale=0.9,
                         margin={"top": "1cm", "bottom": "1cm", "left": "1cm", "right": "1cm"},
                     )
                     pdf_paths.append(out)
