@@ -21,6 +21,8 @@
     .btn-green:hover:not(:disabled) { background: #15803d; }
     .btn-dl { background: #0369a1; color: #fff; }
     .btn-dl:hover { background: #0284c7; }
+    .btn-excel { background: #16a34a; color: #fff; }
+    .btn-excel:hover { background: #15803d; }
     .section-label { font-size: 0.78rem; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: #6b7280; margin-bottom: 12px; }
     .link-list { list-style: none; max-height: 320px; overflow-y: auto; border: 1.5px solid #e5e7eb; border-radius: 8px; }
     .link-list li { padding: 9px 14px; font-size: 0.85rem; border-bottom: 1px solid #f3f4f6; color: #374151; word-break: break-all; }
@@ -81,6 +83,7 @@
     <ul class="link-list" id="progress-list"></ul>
     <div class="actions">
       <a id="dl-zip-btn" class="hidden"><button class="btn-dl">⬇ Download ZIP</button></a>
+      <button class="btn-excel hidden" id="dl-excel-btn" onclick="exportExcel()">📊 Export Excel</button>
     </div>
   </div>
 
@@ -262,6 +265,7 @@
           const dlBtn = document.getElementById('dl-zip-btn');
           dlBtn.href = `/get-zip/${job_id}`;
           dlBtn.classList.remove('hidden');
+          document.getElementById('dl-excel-btn').classList.remove('hidden');
           es.close();
           document.getElementById('download-btn').disabled = false;
         }
@@ -277,6 +281,35 @@
     document.getElementById('url-input').addEventListener('keydown', e => {
       if (e.key === 'Enter') scrapeLinks();
     });
+
+    async function exportExcel() {
+      const btn = document.getElementById('dl-excel-btn');
+      btn.disabled = true;
+      btn.textContent = '⏳ Generating…';
+
+      try {
+        const start_url = document.getElementById('url-input').value.trim();
+        const res = await fetch('/export-excel', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ links: scrapedLinks, start_url })
+        });
+        if (!res.ok) { alert('Export failed.'); return; }
+
+        // Trigger download
+        const blob = await res.blob();
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = 'scraped_pages.xlsx';
+        a.click();
+        URL.revokeObjectURL(a.href);
+      } catch (e) {
+        alert('Export failed: ' + e.message);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '📊 Export Excel';
+      }
+    }
 
     async function clearManifest() {
       if (!confirm('Clear the download cache? You will re-download all pages.')) return;

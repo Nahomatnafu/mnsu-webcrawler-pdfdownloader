@@ -10,6 +10,9 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 from flask import Flask, Response, jsonify, render_template, request, send_file
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
@@ -288,6 +291,92 @@ def _pdf_worker(job_id: str, links: list[str], q: queue.Queue) -> None:
         q.put({"type": "fatal", "reason": str(e)})
 
 
+def export_excel(links: list[dict], start_url: str) -> Path:
+    """
+    Build an Excel workbook from the scraped link list.
+    Columns: #, Page Title (last path segment), Full URL, Folder Path, PDF File, Downloaded, Date, Size KB
+    """
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Scraped Pages"
+
+    # ── Styles ────────────────────────────────────────────────────────────────
+    header_fill   = PatternFill("solid", fgColor="4F46E5")
+    header_font   = Font(color="FFFFFF", bold=True, size=11)
+    done_fill     = PatternFill("solid", fgColor="DCFCE7")
+    pending_fill  = PatternFill("solid", fgColor="FEF9C3")
+    center        = Alignment(horizontal="center", vertical="center")
+    wrap          = Alignment(wrap_text=True, vertical="top")
+    thin          = Side(style="thin", color="E5E7EB")
+    border        = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    # ── Header row ────────────────────────────────────────────────────────────
+    headers = ["#", "Page Name", "Full URL", "Folder Path", "PDF File", "Downloaded", "Date Scraped", "Size (KB)"]
+    for col, h in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col, value=h)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = center
+        cell.border = border
+
+    ws.row_dimensions[1].height = 22
+
+    # ── Data rows ─────────────────────────────────────────────────────────────
+    for i, link in enumerate(links, 1):
+        url      = link.get("url", "")
+        done     = link.get("done", False)
+        file     = link.get("file") or ""
+        scraped  = link.get("scraped_at") or ""
+        size_kb  = link.get("size_kb") or ""
+
+        # Derive page name and folder path from the URL
+        segments = [s for s in urlparse(url).path.strip("/").split("/") if s]
+        page_name   = segments[-1].replace("-", " ").title() if segments else "Home"
+        folder_path = "/".join(segments[:-1]) if len(segments) > 1 else "/"
+
+        row_fill = done_fill if done else pending_fill
+        row = [i, page_name, url, folder_path, file, "✓ Yes" if done else "✗ No", scraped, size_kb]
+
+        for col, val in enumerate(row, 1):
+            cell = ws.cell(row=i + 1, column=col, value=val)
+            cell.fill = row_fill
+            cell.border = border
+            cell.alignment = wrap if col in (3, 4, 5) else center
+
+    # ── Column widths ─────────────────────────────────────────────────────────
+    widths = [5, 28, 60, 45, 50, 14, 20, 12]
+    for col, w in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(col)].width = w
+
+    ws.freeze_panes = "A2"  # Keep header visible when scrolling
+
+    # ── Summary sheet ─────────────────────────────────────────────────────────
+    ws2 = wb.create_sheet("Summary")
+    total       = len(links)
+    downloaded  = sum(1 for l in links if l.get("done"))
+    pending     = total - downloaded
+
+    ws2["A1"], ws2["B1"] = "Starting URL", start_url
+    ws2["A2"], ws2["B2"] = "Total Pages Found", total
+    ws2["A3"], ws2["B3"] = "Downloaded", downloaded
+    ws2["A4"], ws2["B4"] = "Pending", pending
+    ws2["A5"], ws2["B5"] = "Exported At", datetime.now().isoformat(timespec="seconds")
+
+    for row in ws2.iter_rows(min_row=1, max_row=5, min_col=1, max_col=2):
+        for cell in row:
+            cell.border = border
+            if cell.column == 1:
+                cell.font = Font(bold=True)
+
+    ws2.column_dimensions["A"].width = 22
+    ws2.column_dimensions["B"].width = 70
+
+    out_path = OUTPUT_DIR / "scraped_pages.xlsx"
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    wb.save(out_path)
+    return out_path
+
+
 # ── routes ───────────────────────────────────────────────────────────────────
 
 @app.route("/")
@@ -350,6 +439,30 @@ def get_zip(job_id: str):
     if not job or not job.get("zip_path"):
         return "Not ready", 404
     return send_file(job["zip_path"], as_attachment=True, download_name="pages.zip")
+
+
+@app.route("/export-excel", methods=["POST"])
+def export_excel_route():
+    """Generate and return an Excel file from the current link list + manifest."""
+    data       = request.json or {}
+    links      = data.get("links", [])
+    start_url  = data.get("start_url", "")
+    if not links:
+        return jsonify({"error": "No links provided"}), 400
+    try:
+        # Merge manifest status into links in case it's fresher than what the UI has
+        manifest = load_manifest()
+        for link in links:
+            url = link.get("url", "")
+            if url in manifest:
+                link["done"]       = True
+                link["file"]       = manifest[url]["file"]
+                link["scraped_at"] = manifest[url]["scraped_at"]
+                link["size_kb"]    = manifest[url].get("size_kb", "")
+        path = export_excel(links, start_url)
+        return send_file(str(path), as_attachment=True, download_name="scraped_pages.xlsx")
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/clear-manifest", methods=["POST"])
