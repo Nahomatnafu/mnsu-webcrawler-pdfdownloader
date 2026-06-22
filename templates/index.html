@@ -239,7 +239,8 @@
           scrapedLinks = evt.links;
           const newCount = scrapedLinks.filter(l => !l.done).length;
           const doneCount = scrapedLinks.length - newCount;
-          setStatus(`Found ${scrapedLinks.length} page${scrapedLinks.length !== 1 ? 's' : ''}. Switch to the Links tab →`);
+          const skipNote = evt.skipped ? ` (${evt.skipped} page${evt.skipped !== 1 ? 's' : ''} skipped — unreachable/error)` : '';
+          setStatus(`Found ${scrapedLinks.length} page${scrapedLinks.length !== 1 ? 's' : ''} from ${evt.visited || 0} crawled${skipNote}. Switch to the Links tab →`);
           renderLinkList(newCount, doneCount);
           document.getElementById('scrape-btn').disabled = false;
           es.close();

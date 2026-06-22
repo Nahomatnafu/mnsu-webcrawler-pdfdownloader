@@ -103,6 +103,11 @@ TIER2_MODEL = "claude-haiku-4-5"
 ANALYSIS_CONCURRENCY = int(os.getenv("ANALYSIS_CONCURRENCY", "6"))
 SUGGEST_CACHE_DIR = Path("suggestion_cache")
 
+# Safety ceiling on how many pages a single crawl will visit.  The BFS normally
+# stops on its own once it exhausts the in-scope queue; this only caps runaway
+# crawls.  Default is well above large sections so full coverage isn't truncated.
+CRAWL_MAX_PAGES = int(os.getenv("CRAWL_MAX_PAGES", "2000"))
+
 app = Flask(__name__)
 
 # ── CORS ─────────────────────────────────────────────────────────────────────
@@ -217,11 +222,13 @@ def _extract_sublinks(page, start_url: str, base: str, domain: str) -> set[str]:
     return found
 
 
-def _scrape_worker(job_id: str, start_url: str, q: queue.Queue, max_pages: int = 100) -> None:
+def _scrape_worker(job_id: str, start_url: str, q: queue.Queue,
+                   max_pages: int = CRAWL_MAX_PAGES, refresh: bool = False) -> None:
     """Background thread: crawl all sublinks under start_url (with caching)."""
     try:
-        # Check if we have cached crawl results for this URL
-        cached_links = load_crawl_cache(start_url)
+        # Check if we have cached crawl results for this URL (unless a fresh
+        # re-crawl was explicitly requested via refresh).
+        cached_links = None if refresh else load_crawl_cache(start_url)
         if cached_links:
             q.put({"type": "using_cache", "count": len(cached_links)})
             manifest = load_manifest()
@@ -245,6 +252,7 @@ def _scrape_worker(job_id: str, start_url: str, q: queue.Queue, max_pages: int =
         visited: set[str] = set()
         to_visit: list[str] = [start_url.rstrip("/") + "/"]
         all_found: set[str] = set()
+        skipped = 0
 
         with sync_playwright() as pw:
             browser = pw.chromium.launch(args=["--no-sandbox", "--disable-setuid-sandbox"])
@@ -260,10 +268,20 @@ def _scrape_worker(job_id: str, start_url: str, q: queue.Queue, max_pages: int =
 
                     q.put({"type": "crawling", "url": url, "count": len(visited)})
 
+                    # domcontentloaded is reliable for link extraction — we only
+                    # need the parsed DOM, not full network idle (many MNSU pages
+                    # never go idle due to analytics/chat scripts).  Retry once on
+                    # a transient failure, then surface (don't swallow) the skip.
                     try:
-                        page.goto(url, wait_until="networkidle", timeout=15_000)
+                        page.goto(url, wait_until="domcontentloaded", timeout=20_000)
                     except Exception:
-                        continue
+                        try:
+                            page.goto(url, wait_until="domcontentloaded", timeout=20_000)
+                        except Exception as e:
+                            skipped += 1
+                            q.put({"type": "skipped", "url": url,
+                                   "reason": str(e).splitlines()[0][:140]})
+                            continue
 
                     new_links = _extract_sublinks(page, url, base, domain)
                     all_found.update(new_links)
@@ -288,7 +306,8 @@ def _scrape_worker(job_id: str, start_url: str, q: queue.Queue, max_pages: int =
             }
             for l in all_found_sorted
         ]
-        q.put({"type": "complete", "links": links_with_status})
+        q.put({"type": "complete", "links": links_with_status,
+               "visited": len(visited), "skipped": skipped})
     except Exception as e:
         q.put({"type": "fatal", "reason": str(e)})
 
@@ -750,14 +769,17 @@ def index():
 
 @app.route("/scrape", methods=["POST"])
 def scrape():
-    url = (request.json or {}).get("url", "").strip()
+    body = request.json or {}
+    url = body.get("url", "").strip()
     if not url:
         return jsonify({"error": "No URL provided"}), 400
+    refresh = bool(body.get("refresh", False))
 
     job_id = str(uuid.uuid4())
     q: queue.Queue = queue.Queue()
     jobs[job_id] = {"type": "scrape", "queue": q, "links": None, "zip_path": None}
-    threading.Thread(target=_scrape_worker, args=(job_id, url, q), daemon=True).start()
+    threading.Thread(target=_scrape_worker, args=(job_id, url, q),
+                     kwargs={"refresh": refresh}, daemon=True).start()
     return jsonify({"job_id": job_id})
 
 
