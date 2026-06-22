@@ -6,117 +6,213 @@
   <title>Page → PDF</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: system-ui, sans-serif; background: #f4f5f7; color: #1a1a2e; min-height: 100vh; display: flex; flex-direction: column; align-items: center; padding: 48px 16px; }
-    h1 { font-size: 1.6rem; font-weight: 700; margin-bottom: 6px; }
-    .subtitle { color: #6b7280; font-size: 0.9rem; margin-bottom: 32px; }
-    .card { background: #fff; border-radius: 12px; box-shadow: 0 2px 16px rgba(0,0,0,.08); padding: 28px; width: 100%; max-width: 720px; margin-bottom: 20px; }
+    body { font-family: system-ui, sans-serif; background: #f4f5f7; color: #1a1a2e; min-height: 100vh; display: flex; flex-direction: column; align-items: center; padding: 40px 16px; }
+    h1 { font-size: 1.55rem; font-weight: 700; margin-bottom: 5px; }
+    .subtitle { color: #6b7280; font-size: 0.88rem; margin-bottom: 28px; }
+
+    /* ── App shell ── */
+    .app { width: 100%; max-width: 920px; background: #fff; border-radius: 14px; box-shadow: 0 2px 20px rgba(0,0,0,.09); overflow: hidden; }
+
+    /* ── Tab bar ── */
+    .tab-bar { display: flex; background: #f8f9fb; border-bottom: 2px solid #e5e7eb; }
+    .tab { flex: 1; padding: 14px 8px 12px; background: none; border: none; border-bottom: 3px solid transparent; margin-bottom: -2px; font-size: 0.82rem; font-weight: 600; color: #6b7280; cursor: pointer; transition: all .18s; display: flex; flex-direction: column; align-items: center; gap: 3px; }
+    .tab .tab-icon { font-size: 1.15rem; }
+    .tab:hover { color: #4f46e5; background: #f0f1ff; }
+    .tab.active { color: #4f46e5; border-bottom-color: #4f46e5; background: #fff; }
+    .tab-badge { font-size: 0.68rem; background: #e0e7ff; color: #4f46e5; padding: 1px 7px; border-radius: 99px; font-weight: 700; }
+    .tab.active .tab-badge { background: #4f46e5; color: #fff; }
+
+    /* ── Panels ── */
+    .panel { display: none; padding: 28px; min-height: 320px; }
+    .panel.active { display: block; }
+
+    /* ── Common elements ── */
+    .section-label { font-size: 0.73rem; font-weight: 700; text-transform: uppercase; letter-spacing: .07em; color: #9ca3af; margin-bottom: 14px; }
     .input-row { display: flex; gap: 10px; }
     input[type="url"] { flex: 1; padding: 10px 14px; border: 1.5px solid #d1d5db; border-radius: 8px; font-size: 0.95rem; outline: none; transition: border-color .2s; }
     input[type="url"]:focus { border-color: #4f46e5; }
-    button { padding: 10px 20px; border: none; border-radius: 8px; font-size: 0.95rem; font-weight: 600; cursor: pointer; transition: background .2s, opacity .2s; }
+    button { padding: 10px 20px; border: none; border-radius: 8px; font-size: 0.9rem; font-weight: 600; cursor: pointer; transition: background .2s, opacity .2s; }
     button:disabled { opacity: .45; cursor: not-allowed; }
     .btn-primary { background: #4f46e5; color: #fff; }
     .btn-primary:hover:not(:disabled) { background: #4338ca; }
-    .btn-green { background: #16a34a; color: #fff; }
-    .btn-green:hover:not(:disabled) { background: #15803d; }
-    .btn-dl { background: #0369a1; color: #fff; }
-    .btn-dl:hover { background: #0284c7; }
-    .btn-excel { background: #16a34a; color: #fff; }
-    .btn-excel:hover { background: #15803d; }
-    .section-label { font-size: 0.78rem; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: #6b7280; margin-bottom: 12px; }
-    .link-list { list-style: none; max-height: 320px; overflow-y: auto; border: 1.5px solid #e5e7eb; border-radius: 8px; }
-    .link-list li { padding: 9px 14px; font-size: 0.85rem; border-bottom: 1px solid #f3f4f6; color: #374151; word-break: break-all; }
-    .link-list li:last-child { border-bottom: none; }
-    .link-list li.done { color: #16a34a; }
-    .link-list li.done::before { content: "✓  "; }
-    .link-list li.already { color: #9ca3af; }
-    .link-list li.already::before { content: "⟳  "; }
-    .link-list li.fail { color: #dc2626; }
-    .link-list li.fail::before { content: "✗  "; }
-    .link-list li.active { color: #4f46e5; font-weight: 600; }
-    .link-list li.skipped { color: #9ca3af; }
-    .link-list li.skipped::before { content: "–  "; }
-    .badge { display: inline-block; font-size: 0.7rem; font-weight: 700; padding: 1px 6px; border-radius: 4px; margin-left: 6px; vertical-align: middle; }
-    .badge-new { background: #e0e7ff; color: #4f46e5; }
-    .badge-done { background: #dcfce7; color: #16a34a; }
-    .progress-bar-wrap { background: #e5e7eb; border-radius: 99px; height: 10px; margin: 14px 0; overflow: hidden; }
-    .progress-bar { height: 100%; background: #4f46e5; border-radius: 99px; width: 0%; transition: width .3s; }
-    .actions { display: flex; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
-    #status-msg { font-size: 0.85rem; color: #6b7280; margin-top: 10px; min-height: 1.2em; }
+    .btn-green   { background: #16a34a; color: #fff; }
+    .btn-green:hover:not(:disabled)   { background: #15803d; }
+    .btn-dl      { background: #0369a1; color: #fff; }
+    .btn-dl:hover:not(:disabled)      { background: #0284c7; }
+    .btn-excel   { background: #16a34a; color: #fff; }
+    .btn-excel:hover:not(:disabled)   { background: #15803d; }
+    .btn-analyze { background: #7c3aed; color: #fff; }
+    .btn-analyze:hover:not(:disabled) { background: #6d28d9; }
+    .btn-suggest-export { background: #0e7490; color: #fff; }
+    .btn-suggest-export:hover:not(:disabled) { background: #0369a1; }
+    .actions { display: flex; gap: 10px; margin-top: 16px; flex-wrap: wrap; align-items: center; }
     .hidden { display: none !important; }
-    #spinner { display: inline-block; width: 16px; height: 16px; border: 2px solid #c7d2fe; border-top-color: #4f46e5; border-radius: 50%; animation: spin .7s linear infinite; vertical-align: middle; margin-right: 6px; }
+    #status-msg { font-size: 0.85rem; color: #6b7280; margin-top: 10px; min-height: 1.2em; }
+    #spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid #c7d2fe; border-top-color: #4f46e5; border-radius: 50%; animation: spin .7s linear infinite; vertical-align: middle; margin-right: 5px; }
     @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── Link list ── */
+    .link-list { list-style: none; max-height: 340px; overflow-y: auto; border: 1.5px solid #e5e7eb; border-radius: 8px; }
+    .link-list li { padding: 8px 14px; font-size: 0.83rem; border-bottom: 1px solid #f3f4f6; color: #374151; word-break: break-all; }
+    .link-list li:last-child { border-bottom: none; }
+    .link-list li.done::before   { content: "✓  "; color: #16a34a; }
+    .link-list li.already        { color: #9ca3af; }
+    .link-list li.already::before{ content: "⟳  "; }
+    .link-list li.fail::before   { content: "✗  "; color: #dc2626; }
+    .link-list li.active         { color: #4f46e5; font-weight: 600; }
+    .link-list li.skipped        { color: #9ca3af; }
+    .link-list li.skipped::before{ content: "–  "; }
+    .badge { display: inline-block; font-size: 0.68rem; font-weight: 700; padding: 1px 6px; border-radius: 4px; margin-left: 6px; vertical-align: middle; }
+    .badge-new  { background: #e0e7ff; color: #4f46e5; }
+    .badge-done { background: #dcfce7; color: #16a34a; }
+
+    /* ── Progress bar ── */
+    .progress-bar-wrap { background: #e5e7eb; border-radius: 99px; height: 8px; margin: 12px 0; overflow: hidden; }
+    .progress-bar { height: 100%; background: #4f46e5; border-radius: 99px; width: 0%; transition: width .3s; }
+
+    /* ── Suggestion table ── */
+    .suggest-wrap { max-height: 440px; overflow-y: auto; border: 1.5px solid #e5e7eb; border-radius: 8px; }
+    .suggest-table { width: 100%; border-collapse: collapse; font-size: 0.81rem; }
+    .suggest-table th { background: #4f46e5; color: #fff; padding: 8px 10px; text-align: left; font-weight: 600; position: sticky; top: 0; z-index: 1; }
+    .suggest-table td { padding: 7px 10px; border-bottom: 1px solid #f3f4f6; vertical-align: top; word-break: break-word; }
+    .suggest-table tr:hover td { background: #f9fafb; }
+    .chip { display: inline-block; padding: 2px 8px; border-radius: 99px; font-size: 0.72rem; font-weight: 700; white-space: nowrap; }
+    .chip-website  { background: #dbeafe; color: #1d4ed8; }
+    .chip-onestop  { background: #fef3c7; color: #b45309; }
+    .chip-fountain { background: #ede9fe; color: #6d28d9; }
+    .chip-mavlife  { background: #d1fae5; color: #065f46; }
+    .chip-teams    { background: #ccfbf1; color: #0f766e; }
+    .chip-nofit    { background: #f3f4f6; color: #6b7280; }
+    .chip-pending  { background: #f1f5f9; color: #64748b; }
+    .chip-error    { background: #fee2e2; color: #b91c1c; }
+    .conf-high   { color: #16a34a; font-weight: 700; }
+    .conf-medium { color: #d97706; font-weight: 700; }
+    .conf-low    { color: #dc2626; font-weight: 700; }
   </style>
 </head>
 <body>
-  <h1>Page → PDF Downloader</h1>
-  <p class="subtitle">Paste a URL — scrape its sublinks — download all as PDFs</p>
+  <h1>MNSU Content Analyzer</h1>
+  <p class="subtitle">Crawl a URL section · Download PDFs · Get platform suggestions</p>
 
-  <!-- Step 1: URL input -->
-  <div class="card">
-    <div class="section-label">Enter a page URL</div>
-    <div class="input-row">
-      <input type="url" id="url-input" placeholder="https://example.edu/some/section/" />
-      <button class="btn-primary" id="scrape-btn" onclick="scrapeLinks()">Find Sublinks</button>
-    </div>
-    <div id="status-msg"></div>
-    <div style="margin-top:12px; font-size:0.78rem;">
-      <button style="background:#f3f4f6; color:#374151; padding:6px 12px; border-radius:6px; border:1px solid #e5e7eb; cursor:pointer; font-size:0.78rem;" onclick="clearManifest()">🗑 Clear Cache</button>
-      <span id="cache-status" style="margin-left:8px; color:#9ca3af;"></span>
-    </div>
-  </div>
+  <div class="app">
 
-  <!-- Step 2: Link list + download button -->
-  <div class="card hidden" id="links-card">
-    <div class="section-label" id="links-label">Found 0 links</div>
-    <ul class="link-list" id="link-list"></ul>
-    <div class="actions" style="margin-top:16px; align-items:center;">
-      <button class="btn-green" id="download-btn" onclick="startDownload()">⬇ Download New as PDFs</button>
-      <span id="links-summary" style="font-size:0.83rem; color:#6b7280;"></span>
+    <!-- Tab bar -->
+    <div class="tab-bar">
+      <button class="tab active" data-tab="crawl" onclick="switchTab('crawl')">
+        <span class="tab-icon">🌐</span>Crawl
+      </button>
+      <button class="tab" data-tab="links" onclick="switchTab('links')">
+        <span class="tab-icon">📋</span>
+        <span>Links <span class="tab-badge hidden" id="links-count-badge">0</span></span>
+      </button>
+      <button class="tab" data-tab="download" onclick="switchTab('download')">
+        <span class="tab-icon">⬇</span>Download
+      </button>
+      <button class="tab" data-tab="suggest" onclick="switchTab('suggest')">
+        <span class="tab-icon">💡</span>Suggest
+      </button>
     </div>
-  </div>
 
-  <!-- Step 3: Progress -->
-  <div class="card hidden" id="progress-card">
-    <div class="section-label" id="progress-label">Generating PDFs…</div>
-    <div class="progress-bar-wrap"><div class="progress-bar" id="progress-bar"></div></div>
-    <ul class="link-list" id="progress-list"></ul>
-    <div class="actions">
-      <a id="dl-zip-btn" class="hidden"><button class="btn-dl">⬇ Download ZIP</button></a>
-      <button class="btn-excel hidden" id="dl-excel-btn" onclick="exportExcel()">📊 Export Excel</button>
+    <!-- Panel: Crawl -->
+    <div class="panel active" id="panel-crawl">
+      <div class="section-label">Enter a page URL to crawl</div>
+      <div class="input-row">
+        <input type="url" id="url-input" placeholder="https://example.edu/some/section/" />
+        <button class="btn-primary" id="scrape-btn" onclick="scrapeLinks()">Find Sublinks</button>
+      </div>
+      <div id="status-msg"></div>
+      <div style="margin-top:14px;">
+        <button style="background:#f3f4f6;color:#374151;padding:6px 12px;border-radius:6px;border:1px solid #e5e7eb;cursor:pointer;font-size:0.78rem;" onclick="clearManifest()">🗑 Clear Cache</button>
+        <span id="cache-status" style="margin-left:8px;color:#9ca3af;font-size:0.82rem;"></span>
+      </div>
     </div>
-  </div>
+
+    <!-- Panel: Links -->
+    <div class="panel" id="panel-links">
+      <div class="section-label" id="links-label">No links found yet — go to Crawl first</div>
+      <ul class="link-list" id="link-list"></ul>
+      <div class="actions">
+        <button class="btn-green" id="download-btn" onclick="startDownload()">⬇ Download New as PDFs</button>
+        <button class="btn-analyze" id="analyze-btn" onclick="analyzeLinks()">🔍 Analyze Platforms</button>
+        <span id="links-summary" style="font-size:0.83rem;color:#6b7280;"></span>
+      </div>
+    </div>
+
+    <!-- Panel: Download -->
+    <div class="panel" id="panel-download">
+      <div class="section-label" id="progress-label">Generating PDFs…</div>
+      <div class="progress-bar-wrap"><div class="progress-bar" id="progress-bar"></div></div>
+      <ul class="link-list" id="progress-list"></ul>
+      <div class="actions">
+        <a id="dl-zip-btn" class="hidden"><button class="btn-dl">⬇ Download ZIP</button></a>
+        <button class="btn-excel hidden" id="dl-excel-btn" onclick="exportExcel()">📊 Export Excel</button>
+      </div>
+    </div>
+
+    <!-- Panel: Suggest -->
+    <div class="panel" id="panel-suggest">
+      <div class="section-label">Platform Suggestions</div>
+      <div id="suggest-status" style="font-size:0.85rem;color:#6b7280;margin-bottom:10px;">
+        Run <strong>🔍 Analyze Platforms</strong> from the Links tab to get started.
+      </div>
+      <div class="progress-bar-wrap hidden" id="suggest-bar-wrap">
+        <div class="progress-bar" id="suggest-bar"></div>
+      </div>
+      <div class="suggest-wrap">
+        <table class="suggest-table">
+          <thead>
+            <tr>
+              <th style="width:36px;">#</th>
+              <th style="width:150px;">Page Name</th>
+              <th>URL</th>
+              <th style="width:165px;">Suggested Platform</th>
+              <th style="width:90px;">Confidence</th>
+              <th>Reason</th>
+            </tr>
+          </thead>
+          <tbody id="suggest-tbody"></tbody>
+        </table>
+      </div>
+      <div class="actions">
+        <button class="btn-suggest-export hidden" id="suggest-export-btn" onclick="exportSuggestions()">📥 Export Suggestions Excel</button>
+      </div>
+    </div>
+
+  </div><!-- /.app -->
 
   <script>
-    let scrapedLinks = [];   // array of {url, done, file, scraped_at}
-    let scrapeJobId = null;
+    let scrapedLinks = [];
+    let suggestionResults = [];
 
+    // ── Tab switching ─────────────────────────────────────────────────────────
+    function switchTab(name) {
+      document.querySelectorAll('.tab').forEach(t =>
+        t.classList.toggle('active', t.dataset.tab === name));
+      document.querySelectorAll('.panel').forEach(p =>
+        p.classList.toggle('active', p.id === 'panel-' + name));
+    }
+
+    // ── Status helper ─────────────────────────────────────────────────────────
     function setStatus(msg, spin = false) {
       const el = document.getElementById('status-msg');
       el.innerHTML = spin ? `<span id="spinner"></span>${msg}` : msg;
     }
 
+    // ── Crawl ─────────────────────────────────────────────────────────────────
     async function scrapeLinks() {
       const url = document.getElementById('url-input').value.trim();
       if (!url) { setStatus('Please enter a URL.'); return; }
-
       const btn = document.getElementById('scrape-btn');
       btn.disabled = true;
-      document.getElementById('links-card').classList.add('hidden');
-      document.getElementById('progress-card').classList.add('hidden');
       setStatus('Starting crawler…', true);
-
       try {
         const res = await fetch('/scrape', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ url })
         });
         const data = await res.json();
         if (data.error) { setStatus('Error: ' + data.error); btn.disabled = false; return; }
-
-        scrapeJobId = data.job_id;
-        listenToScrapeProgress(scrapeJobId);
+        listenToScrapeProgress(data.job_id);
       } catch (e) {
         setStatus('Request failed: ' + e.message);
         btn.disabled = false;
@@ -125,37 +221,30 @@
 
     function listenToScrapeProgress(jobId) {
       const es = new EventSource(`/progress/${jobId}`);
-      let crawlCount = 0;
-
       es.onmessage = (e) => {
         const evt = JSON.parse(e.data);
-
         if (evt.type === 'using_cache') {
-          setStatus(`✓ Loaded ${evt.count} cached links (no crawl needed)!`, false);
+          setStatus(`✓ Loaded ${evt.count} cached links instantly!`);
         }
-
         if (evt.type === 'crawling') {
-          crawlCount = evt.count;
-          setStatus(`Crawling… found ${crawlCount} page${crawlCount !== 1 ? 's' : ''} so far.`, true);
+          setStatus(`Crawling… found ${evt.count} page${evt.count !== 1 ? 's' : ''} so far.`, true);
         }
-
         if (evt.type === 'complete') {
           scrapedLinks = evt.links;
           const newCount = scrapedLinks.filter(l => !l.done).length;
           const doneCount = scrapedLinks.length - newCount;
-          setStatus(`Found ${scrapedLinks.length} page${scrapedLinks.length !== 1 ? 's' : ''}.`);
+          setStatus(`Found ${scrapedLinks.length} page${scrapedLinks.length !== 1 ? 's' : ''}. Switch to the Links tab →`);
           renderLinkList(newCount, doneCount);
           document.getElementById('scrape-btn').disabled = false;
           es.close();
+          switchTab('links');
         }
-
         if (evt.type === 'fatal') {
           setStatus('Error: ' + evt.reason);
           document.getElementById('scrape-btn').disabled = false;
           es.close();
         }
       };
-
       es.onerror = () => {
         setStatus('Connection lost.');
         document.getElementById('scrape-btn').disabled = false;
@@ -164,51 +253,46 @@
     }
 
     function renderLinkList(newCount, doneCount) {
-      const list = document.getElementById('link-list');
-      document.getElementById('links-label').textContent =
-        `Found ${scrapedLinks.length} sublinks`;
+      document.getElementById('links-label').textContent = `Found ${scrapedLinks.length} sublinks`;
 
-      list.innerHTML = scrapedLinks.map(l => {
+      // Update tab badge
+      const badge = document.getElementById('links-count-badge');
+      badge.textContent = scrapedLinks.length;
+      badge.classList.remove('hidden');
+
+      document.getElementById('link-list').innerHTML = scrapedLinks.map(l => {
         if (l.done) {
-          return `<li class="already" title="Saved as: ${l.file} on ${l.scraped_at}">
-            ${l.url} <span class="badge badge-done">already downloaded</span></li>`;
+          return `<li class="already" title="Saved as: ${l.file} on ${l.scraped_at}">${l.url} <span class="badge badge-done">downloaded</span></li>`;
         }
         return `<li>${l.url} <span class="badge badge-new">new</span></li>`;
       }).join('');
 
-      const summary = doneCount > 0
-        ? `${newCount} new · ${doneCount} already downloaded (will be skipped)`
+      document.getElementById('links-summary').textContent = doneCount > 0
+        ? `${newCount} new · ${doneCount} already downloaded`
         : `${newCount} new`;
-      document.getElementById('links-summary').textContent = summary;
 
       const downloadBtn = document.getElementById('download-btn');
       downloadBtn.disabled = newCount === 0;
-      downloadBtn.textContent = newCount > 0
-        ? `⬇ Download ${newCount} New as PDFs`
-        : '✓ All pages already downloaded';
-
-      document.getElementById('links-card').classList.remove('hidden');
+      downloadBtn.textContent = newCount > 0 ? `⬇ Download ${newCount} New as PDFs` : '✓ All pages already downloaded';
     }
 
+    // ── Download ──────────────────────────────────────────────────────────────
     async function startDownload() {
       const newLinks = scrapedLinks.filter(l => !l.done).map(l => l.url);
       if (!newLinks.length) return;
       document.getElementById('download-btn').disabled = true;
-
-      const progCard = document.getElementById('progress-card');
-      progCard.classList.remove('hidden');
       document.getElementById('progress-list').innerHTML = '';
       document.getElementById('progress-bar').style.width = '0%';
       document.getElementById('progress-label').textContent = 'Generating PDFs…';
       document.getElementById('dl-zip-btn').classList.add('hidden');
+      document.getElementById('dl-excel-btn').classList.add('hidden');
+      switchTab('download');
 
       const res = await fetch('/start-download', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ links: newLinks })
       });
       const { job_id } = await res.json();
-
       const es = new EventSource(`/progress/${job_id}`);
       const progList = document.getElementById('progress-list');
       const bar = document.getElementById('progress-bar');
@@ -216,99 +300,236 @@
 
       es.onmessage = (e) => {
         const evt = JSON.parse(e.data);
-
         if (evt.type === 'progress') {
-          const pct = Math.round((evt.current - 1) / evt.total * 100);
-          bar.style.width = pct + '%';
-          document.getElementById('progress-label').textContent =
-            `Generating PDF ${evt.current} of ${evt.total}…`;
-          const li = document.createElement('li');
-          li.textContent = evt.url;
-          li.classList.add('active');
-          progList.appendChild(li);
-          li.scrollIntoView({ block: 'nearest' });
-          items[evt.url] = li;
+          bar.style.width = Math.round((evt.current - 1) / evt.total * 100) + '%';
+          document.getElementById('progress-label').textContent = `Generating PDF ${evt.current} of ${evt.total}…`;
+          const li = document.createElement('li'); li.textContent = evt.url; li.classList.add('active');
+          progList.appendChild(li); li.scrollIntoView({ block: 'nearest' }); items[evt.url] = li;
         }
-
         if (evt.type === 'skipped') {
-          const li = document.createElement('li');
-          li.classList.add('skipped');
-          li.textContent = `${evt.file}  (already downloaded)`;
-          progList.appendChild(li);
+          const li = document.createElement('li'); li.classList.add('skipped');
+          li.textContent = `${evt.file}  (already downloaded)`; progList.appendChild(li);
         }
-
         if (evt.type === 'done_one') {
           const li = items[evt.url];
-          if (li) {
-            li.classList.remove('active');
-            li.classList.add('done');
-            li.textContent = `${evt.file}  (${evt.size_kb} KB)`;
-          }
+          if (li) { li.classList.replace('active', 'done'); li.textContent = `${evt.file}  (${evt.size_kb} KB)`; }
         }
-
         if (evt.type === 'error_one') {
           const li = items[evt.url];
-          if (li) {
-            li.classList.remove('active');
-            li.classList.add('fail');
-            li.textContent = `${evt.url} — ${evt.reason}`;
-          }
+          if (li) { li.classList.replace('active', 'fail'); li.textContent = `${evt.url} — ${evt.reason}`; }
         }
-
         if (evt.type === 'status') {
           document.getElementById('progress-label').textContent = evt.message;
         }
-
         if (evt.type === 'complete') {
           bar.style.width = '100%';
-          document.getElementById('progress-label').textContent = 'All PDFs ready! Download below ↓';
+          document.getElementById('progress-label').textContent = 'All PDFs ready!';
           const dlBtn = document.getElementById('dl-zip-btn');
-          dlBtn.href = `/get-zip/${job_id}`;
-          dlBtn.classList.remove('hidden');
+          dlBtn.href = `/get-zip/${job_id}`; dlBtn.classList.remove('hidden');
           document.getElementById('dl-excel-btn').classList.remove('hidden');
-          es.close();
           document.getElementById('download-btn').disabled = false;
+          es.close();
         }
-
         if (evt.type === 'fatal') {
           document.getElementById('progress-label').textContent = 'Error: ' + evt.reason;
-          es.close();
-          document.getElementById('download-btn').disabled = false;
+          document.getElementById('download-btn').disabled = false; es.close();
         }
       };
     }
 
-    document.getElementById('url-input').addEventListener('keydown', e => {
-      if (e.key === 'Enter') scrapeLinks();
-    });
-
     async function exportExcel() {
       const btn = document.getElementById('dl-excel-btn');
-      btn.disabled = true;
-      btn.textContent = '⏳ Generating…';
-
+      btn.disabled = true; btn.textContent = '⏳ Generating…';
       try {
-        const start_url = document.getElementById('url-input').value.trim();
         const res = await fetch('/export-excel', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ links: scrapedLinks, start_url })
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ links: scrapedLinks, start_url: document.getElementById('url-input').value.trim() })
         });
         if (!res.ok) { alert('Export failed.'); return; }
+        triggerDownload(await res.blob(), 'scraped_pages.xlsx');
+      } catch (e) { alert('Export failed: ' + e.message); }
+      finally { btn.disabled = false; btn.textContent = '📊 Export Excel'; }
+    }
 
-        // Trigger download
-        const blob = await res.blob();
-        const a = document.createElement('a');
-        a.href = URL.createObjectURL(blob);
-        a.download = 'scraped_pages.xlsx';
-        a.click();
-        URL.revokeObjectURL(a.href);
+    // ── Platform Suggestions ──────────────────────────────────────────────────
+    const PLATFORM_CHIP = {
+      "Website":               "chip chip-website",
+      "Maverick OneStop":      "chip chip-onestop",
+      "The Fountain":          "chip chip-fountain",
+      "MavLife / Student Hub": "chip chip-mavlife",
+      "Teams / SharePoint":    "chip chip-teams",
+      "No Clear Fit":          "chip chip-nofit",
+    };
+    const CONF_CLASS = { "High": "conf-high", "Medium": "conf-medium", "Low": "conf-low" };
+
+    async function analyzeLinks() {
+      if (!scrapedLinks.length) { alert('Scrape some links first.'); return; }
+      const n = scrapedLinks.length;
+      const estCost = (n * 0.0015).toFixed(2);
+      if (!confirm(
+        `Analyze ${n} page${n !== 1 ? 's' : ''} with AI?\n\n` +
+        `Each page's content is read and classified by Claude using the Content Management Guide.\n` +
+        `Estimated cost: ~$${estCost} (about $0.0015 per page).`
+      )) return;
+
+      const btn = document.getElementById('analyze-btn');
+      btn.disabled = true; btn.textContent = '⏳ Analyzing…';
+      suggestionResults = [];
+      document.getElementById('suggest-tbody').innerHTML = '';
+      document.getElementById('suggest-bar').style.width = '0%';
+      document.getElementById('suggest-bar-wrap').classList.remove('hidden');
+      document.getElementById('suggest-status').textContent = 'Loading pages…';
+      document.getElementById('suggest-export-btn').classList.add('hidden');
+      switchTab('suggest');
+      try {
+        const res = await fetch('/analyze-platforms', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ links: scrapedLinks })
+        });
+        const data = await res.json();
+        if (data.error) {
+          alert('Error: ' + data.error);
+          btn.disabled = false; btn.textContent = '🔍 Analyze Platforms'; return;
+        }
+        listenToAnalysisProgress(data.job_id);
       } catch (e) {
-        alert('Export failed: ' + e.message);
-      } finally {
-        btn.disabled = false;
-        btn.textContent = '📊 Export Excel';
+        alert('Failed: ' + e.message); btn.disabled = false; btn.textContent = '🔍 Analyze Platforms';
       }
+    }
+
+    function resetAnalyzeBtn() {
+      const ab = document.getElementById('analyze-btn');
+      ab.disabled = false; ab.textContent = '🔍 Analyze Platforms';
+    }
+
+    function listenToAnalysisProgress(jobId) {
+      const es = new EventSource(`/progress/${jobId}`);
+      const tbody  = document.getElementById('suggest-tbody');
+      const bar    = document.getElementById('suggest-bar');
+      const status = document.getElementById('suggest-status');
+
+      es.onmessage = (e) => {
+        const evt = JSON.parse(e.data);
+
+        // ── Instant placeholder row per URL ───────────────────────────────────
+        if (evt.type === 'analysis_placeholder') {
+          suggestionResults.push(evt);
+          const tr = document.createElement('tr');
+          tr.id = `row-${evt.index}`;
+          tr.innerHTML = `
+            <td style="text-align:center">${evt.index}</td>
+            <td class="cell-name">${evt.page_name}</td>
+            <td style="font-size:0.74rem;color:#6b7280;">${evt.url}</td>
+            <td class="cell-platform"><span class="chip chip-pending">⏳ Analyzing…</span></td>
+            <td class="cell-confidence" style="text-align:center;color:#9ca3af;">—</td>
+            <td class="cell-reason" style="color:#9ca3af;">Reading page content…</td>`;
+          tbody.appendChild(tr);
+        }
+
+        // ── AI batch started ──────────────────────────────────────────────────
+        if (evt.type === 'analysis_started') {
+          status.innerHTML =
+            `⚡ <strong>AI analysis</strong> — classifying ${evt.total} page${evt.total !== 1 ? 's' : ''} using Claude…`;
+        }
+
+        // ── A row's AI result arrives (out of order) ──────────────────────────
+        if (evt.type === 'analysis_upgrade') {
+          bar.style.width = Math.round(evt.done / evt.total * 100) + '%';
+          status.innerHTML = `⚡ <strong>AI analysis</strong> — ${evt.done} of ${evt.total} done…`;
+
+          const stored = suggestionResults.find(r => r.index === evt.index);
+          if (stored) {
+            stored.platform = evt.platform; stored.confidence = evt.confidence;
+            stored.reason = evt.reason; stored.tier = 2;
+            if (evt.page_name) stored.page_name = evt.page_name;
+          }
+
+          const tr = document.getElementById(`row-${evt.index}`);
+          if (tr) {
+            if (evt.page_name) {
+              const nameCell = tr.querySelector('.cell-name');
+              if (nameCell) nameCell.textContent = evt.page_name;
+            }
+            const badge = evt.cached
+              ? ` <span style="font-size:0.68rem;background:#e0e7ff;color:#3730a3;padding:1px 5px;border-radius:4px;font-weight:700;">cached</span>`
+              : ` <span style="font-size:0.68rem;background:#fef9c3;color:#854d0e;padding:1px 5px;border-radius:4px;font-weight:700;">⚡ AI</span>`;
+            tr.querySelector('.cell-platform').innerHTML =
+              `<span class="${PLATFORM_CHIP[evt.platform] || 'chip chip-nofit'}">${evt.platform}</span>` + badge;
+            const confCell = tr.querySelector('.cell-confidence');
+            confCell.className = `cell-confidence ${CONF_CLASS[evt.confidence] || ''}`;
+            confCell.style.textAlign = 'center';
+            confCell.textContent = evt.confidence;
+            const reasonCell = tr.querySelector('.cell-reason');
+            reasonCell.style.color = '#374151';
+            reasonCell.textContent = evt.reason;
+            tr.style.transition = 'background .1s';
+            tr.style.background = '#fef9c3';
+            setTimeout(() => { tr.style.background = ''; }, 1000);
+          }
+        }
+
+        // ── A row failed (fetch or AI error) — mark it visibly ────────────────
+        if (evt.type === 'analysis_error') {
+          bar.style.width = Math.round(evt.done / evt.total * 100) + '%';
+          const stored = suggestionResults.find(r => r.index === evt.index);
+          if (stored) {
+            stored.platform = 'No Clear Fit'; stored.confidence = 'Low';
+            stored.reason = 'Could not analyze: ' + evt.reason; stored.tier = 2;
+          }
+          const tr = document.getElementById(`row-${evt.index}`);
+          if (tr) {
+            tr.querySelector('.cell-platform').innerHTML =
+              `<span class="chip chip-error">⚠ Failed</span>`;
+            const confCell = tr.querySelector('.cell-confidence');
+            confCell.className = 'cell-confidence conf-low';
+            confCell.style.textAlign = 'center'; confCell.textContent = 'Low';
+            const reasonCell = tr.querySelector('.cell-reason');
+            reasonCell.style.color = '#b91c1c';
+            reasonCell.textContent = 'Could not analyze: ' + evt.reason;
+          }
+        }
+
+        // ── Done ──────────────────────────────────────────────────────────────
+        if (evt.type === 'analysis_complete') {
+          bar.style.width = '100%';
+          const failed = suggestionResults.filter(
+            r => typeof r.reason === 'string' && r.reason.startsWith('Could not analyze')).length;
+          const ok = evt.total - failed;
+          status.textContent = failed
+            ? `✓ Done — ${ok} of ${evt.total} classified (${failed} failed)`
+            : `✓ Done — ${evt.total} pages classified by AI`;
+          document.getElementById('suggest-export-btn').classList.remove('hidden');
+          resetAnalyzeBtn();
+          es.close();
+        }
+
+        if (evt.type === 'fatal') {
+          status.textContent = 'Error: ' + evt.reason;
+          resetAnalyzeBtn();
+          es.close();
+        }
+      };
+    }
+
+    async function exportSuggestions() {
+      const btn = document.getElementById('suggest-export-btn');
+      btn.disabled = true; btn.textContent = '⏳ Generating…';
+      try {
+        const res = await fetch('/export-suggestions', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ results: suggestionResults, start_url: document.getElementById('url-input').value.trim() })
+        });
+        if (!res.ok) { alert('Export failed.'); return; }
+        triggerDownload(await res.blob(), 'platform_suggestions.xlsx');
+      } catch (e) { alert('Export failed: ' + e.message); }
+      finally { btn.disabled = false; btn.textContent = '📥 Export Suggestions Excel'; }
+    }
+
+    // ── Utilities ─────────────────────────────────────────────────────────────
+    function triggerDownload(blob, filename) {
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob); a.download = filename; a.click();
+      URL.revokeObjectURL(a.href);
     }
 
     async function clearManifest() {
@@ -320,10 +541,12 @@
           document.getElementById('cache-status').textContent = 'Cache cleared ✓';
           setTimeout(() => { document.getElementById('cache-status').textContent = ''; }, 3000);
         }
-      } catch (e) {
-        alert('Failed to clear cache: ' + e.message);
-      }
+      } catch (e) { alert('Failed: ' + e.message); }
     }
+
+    document.getElementById('url-input').addEventListener('keydown', e => {
+      if (e.key === 'Enter') scrapeLinks();
+    });
   </script>
 </body>
 </html>

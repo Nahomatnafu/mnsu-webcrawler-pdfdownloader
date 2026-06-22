@@ -31,9 +31,14 @@ ENV/
 *.swp
 *.swo
 
+# Environment / secrets
+.env
+.env.*
+
 # Project-specific
 mankato_pdfs/
 crawl_cache/
+suggestion_cache/
 *.pdf
 pages.zip
 manifest.json

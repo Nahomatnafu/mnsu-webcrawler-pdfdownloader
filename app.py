@@ -5,16 +5,101 @@ Run:  python app.py
 Open: http://localhost:5000
 """
 
-import json, os, queue, re, tempfile, threading, time, uuid, zipfile
+import asyncio, hashlib, json, os, queue, re, tempfile, threading, time, uuid, zipfile
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
+import anthropic
 import openpyxl
+from dotenv import load_dotenv
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from flask import Flask, Response, jsonify, render_template, request, send_file
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+from playwright.async_api import async_playwright
+from classifier import normalize_platform, clamp_platform
+
+load_dotenv()
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+
+# ── Content Management Guide → cached Claude system prompt ─────────────────────
+# The guide markdown is the single source of truth.  We extract its
+# platform-definitions section and inject it verbatim into the system prompt so
+# that editing the guide changes the AI's behavior with no code changes.
+GUIDE_PATH = Path("University_Comprehensive_Content_Management_Guide.md")
+GUIDE_SECTION_START = "## Overview of MSU's Main Content Platforms"
+GUIDE_SECTION_END = "## Content Audit"
+
+
+def load_platform_guide() -> str:
+    """Extract the platform-definitions section from the content management guide."""
+    try:
+        text = GUIDE_PATH.read_text(encoding="utf-8")
+    except Exception:
+        return ""
+    start = text.find(GUIDE_SECTION_START)
+    if start == -1:
+        return ""
+    end = text.find(GUIDE_SECTION_END, start + len(GUIDE_SECTION_START))
+    return (text[start:end] if end != -1 else text[start:]).strip()
+
+
+def guide_version() -> str:
+    """Short hash of the guide file, used to invalidate cached suggestions on edit."""
+    try:
+        return hashlib.md5(GUIDE_PATH.read_bytes()).hexdigest()[:8]
+    except Exception:
+        return "noguide"
+
+
+# Fixed instructions; the large, stable guide block is appended and prompt-cached.
+TIER2_INSTRUCTIONS = """You are a content strategist at Minnesota State University, Mankato (MNSU).
+Your job: read a university web page's content and decide which single MNSU content platform it should live on, based STRICTLY on the official Content Management Guide provided below.
+
+You will receive a page's title, URL, and a content excerpt. Judge by the actual content and its primary audience and purpose — NOT by the URL structure. A page sitting under a public-facing section can still belong on another platform.
+
+VALID PLATFORMS (respond with one of these EXACT names):
+- Website
+- Maverick OneStop
+- The Fountain
+- MavLife / Student Hub
+- Teams / SharePoint
+- No Clear Fit
+
+DECISION GUIDANCE (always defer to the guide below):
+- Policies, conduct codes, required procedures, forms, FAQs, and step-by-step task instructions → Maverick OneStop, even under a public URL like /housing/policies/.
+- Purely informational or marketing pages for prospective students, families, or the general public → Website.
+- Content exclusively for employees (not students) → The Fountain.
+- Student involvement, clubs, activities, recreation, engagement → MavLife / Student Hub.
+- Internal department/committee collaboration material → Teams / SharePoint.
+- If nothing genuinely fits, use "No Clear Fit".
+
+CONFIDENCE CALIBRATION — be honest, never manufacture confidence:
+- High: The content unambiguously fits ONE platform; an expert would agree instantly with no reasonable alternative.
+- Medium: One platform is the best fit, but a defensible argument exists for one alternative.
+- Low: Multiple platforms are genuinely defensible, or the excerpt is too thin to tell. Use this freely.
+
+Respond with a single raw JSON object — no markdown, no code fences, no extra text:
+{"platform": "<exact platform name>", "confidence": "High|Medium|Low", "reason": "<one concise sentence grounded in the guide>"}
+
+--- OFFICIAL CONTENT MANAGEMENT GUIDE (SOURCE OF TRUTH) ---
+"""
+
+PLATFORM_GUIDE = load_platform_guide()
+GUIDE_VERSION = guide_version()
+
+# Anthropic prompt-caching: the large, constant guide block is marked ephemeral
+# so it is cached across the whole batch, cutting input cost/latency dramatically.
+TIER2_SYSTEM_BLOCKS = [
+    {"type": "text", "text": TIER2_INSTRUCTIONS},
+    {"type": "text", "text": PLATFORM_GUIDE, "cache_control": {"type": "ephemeral"}},
+]
+
+# Concurrency + model settings for the AI analysis pipeline.
+TIER2_MODEL = "claude-haiku-4-5"
+ANALYSIS_CONCURRENCY = 6        # simultaneous page fetches + API calls
+SUGGEST_CACHE_DIR = Path("suggestion_cache")
 
 app = Flask(__name__)
 jobs: dict = {}          # job_id -> {"type": "scrape"|"download", "queue": Queue, "links": list|None, "zip_path": str|None}
@@ -96,6 +181,11 @@ def _extract_sublinks(page, start_url: str, base: str, domain: str) -> set[str]:
         p2 = urlparse(abs_url)
         clean = f"{p2.scheme}://{p2.netloc}{p2.path}"
         clean_path = p2.path.rstrip("/")
+
+        # Skip broken/redirect links (SharePoint ~/link/hash.aspx pattern)
+        if "~/link/" in clean_path:
+            continue
+
         if p2.netloc == domain and (
             clean_path == base or clean_path.startswith(base + "/")
         ):
@@ -377,6 +467,256 @@ def export_excel(links: list[dict], start_url: str) -> Path:
     return out_path
 
 
+# ── Suggestion result cache (keyed by URL + guide version) ─────────────────────
+
+def _suggest_cache_path(url: str) -> Path:
+    """Cache file for an AI suggestion, invalidated automatically when the guide changes."""
+    key = hashlib.md5(f"{url}|{GUIDE_VERSION}".encode()).hexdigest()[:12]
+    SUGGEST_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    return SUGGEST_CACHE_DIR / f"{key}.json"
+
+
+def _load_suggest_cache(url: str) -> dict | None:
+    path = _suggest_cache_path(url)
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+    return None
+
+
+def _save_suggest_cache(url: str, data: dict) -> None:
+    try:
+        _suggest_cache_path(url).write_text(json.dumps(data), encoding="utf-8")
+    except Exception:
+        pass
+
+
+async def _call_claude(client, page_name: str, url: str, excerpt: str) -> dict | None:
+    """Classify one page with Claude. Retries transient API failures with backoff."""
+    user_msg = (
+        f"Page title: {page_name}\n"
+        f"URL: {url}\n\n"
+        f"Content excerpt:\n{excerpt}\n\n"
+        "Classify this page into the single best MNSU platform per the guide. "
+        "If the content is ambiguous or too thin to tell, use Low confidence."
+    )
+    for attempt in range(3):
+        try:
+            resp = await client.messages.create(
+                model=TIER2_MODEL,
+                max_tokens=256,
+                system=TIER2_SYSTEM_BLOCKS,
+                messages=[{"role": "user", "content": user_msg}],
+            )
+        except Exception:
+            await asyncio.sleep(1.5 * (attempt + 1))   # backoff on rate-limit/overload
+            continue
+        try:
+            raw = resp.content[0].text.strip()
+            if raw.startswith("```"):
+                raw = re.sub(r"^```[a-z]*\n?", "", raw)
+                raw = re.sub(r"\n?```$", "", raw.strip())
+            ai = json.loads(raw.strip())
+            platform = clamp_platform(normalize_platform(ai.get("platform", "")))
+            confidence = ai.get("confidence", "Low")
+            if confidence not in ("High", "Medium", "Low"):
+                confidence = "Low"
+            reason = (ai.get("reason") or "").strip() or "No reason provided."
+            return {"platform": platform, "confidence": confidence, "reason": reason}
+        except Exception:
+            return None   # malformed JSON won't be fixed by retrying
+    return None
+
+
+async def _run_ai_analysis(results: list[dict], by_index: dict[int, dict], q: queue.Queue) -> None:
+    """Fetch + classify every page concurrently, streaming upgrades as each finishes."""
+    total = len(results)
+    sem = asyncio.Semaphore(ANALYSIS_CONCURRENCY)
+    client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(args=["--no-sandbox", "--disable-setuid-sandbox"])
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 AppleWebKit/537.36 Chrome/120 Safari/537.36"
+        )
+
+        async def analyze_one(result: dict) -> dict:
+            idx, url = result["index"], result["url"]
+            cached = _load_suggest_cache(url)
+            if cached:
+                return {"index": idx, **cached, "cached": True}
+
+            async with sem:
+                page = await context.new_page()
+                try:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=20_000)
+                    title = (await page.title()).strip()
+                    raw_text = await page.inner_text("body")
+                except Exception as e:
+                    return {"index": idx, "error": str(e)}
+                finally:
+                    await page.close()
+
+                excerpt = " ".join(raw_text.split()[:600])
+                page_name = title or result["page_name"]
+                ai = await _call_claude(client, page_name, url, excerpt)
+
+            if ai is None:
+                return {"index": idx, "error": "AI classification failed"}
+            out = {"page_name": page_name, **ai}
+            _save_suggest_cache(url, out)
+            return {"index": idx, **out}
+
+        tasks = [asyncio.create_task(analyze_one(r)) for r in results]
+        done = 0
+        for fut in asyncio.as_completed(tasks):
+            res = await fut
+            done += 1
+            idx = res["index"]
+            if res.get("error"):
+                q.put({"type": "analysis_error", "index": idx, "reason": res["error"],
+                       "done": done, "total": total})
+                continue
+            stored = by_index[idx]
+            stored.update(page_name=res["page_name"], platform=res["platform"],
+                          confidence=res["confidence"], reason=res["reason"], tier=2)
+            q.put({"type": "analysis_upgrade", "index": idx, "page_name": res["page_name"],
+                   "platform": res["platform"], "confidence": res["confidence"],
+                   "reason": res["reason"], "cached": res.get("cached", False),
+                   "done": done, "total": total})
+
+        await browser.close()
+
+
+def _analysis_worker(job_id: str, links: list[dict], q: queue.Queue) -> None:
+    """
+    Background thread: AI-only platform classification.
+      1. Emit instant placeholder rows so the table fills immediately.
+      2. Concurrently fetch each page and let Claude classify it using the guide.
+    """
+    total = len(links)
+    results: list[dict] = []
+    by_index: dict[int, dict] = {}
+
+    try:
+        # ── Instant placeholder rows ──────────────────────────────────────────
+        for i, link in enumerate(links, 1):
+            url = link.get("url", "")
+            segments = [s for s in urlparse(url).path.strip("/").split("/") if s]
+            page_name = segments[-1].replace("-", " ").title() if segments else "Home"
+            result = {
+                "index":      i,
+                "total":      total,
+                "url":        url,
+                "page_name":  page_name,
+                "platform":   "Analyzing…",
+                "confidence": "—",
+                "reason":     "Reading page content…",
+                "tier":       1,
+            }
+            results.append(result)
+            by_index[i] = result
+            q.put({"type": "analysis_placeholder", **result})
+
+        if not ANTHROPIC_API_KEY:
+            q.put({"type": "fatal",
+                   "reason": "No ANTHROPIC_API_KEY set — add it to .env to enable AI analysis."})
+            return
+
+        # ── AI analysis (async, concurrent) ───────────────────────────────────
+        q.put({"type": "analysis_started", "total": total})
+        asyncio.run(_run_ai_analysis(results, by_index, q))
+
+        jobs[job_id]["analysis_results"] = results
+        q.put({"type": "analysis_complete", "total": total})
+    except Exception as e:
+        q.put({"type": "fatal", "reason": str(e)})
+
+
+def export_suggestions(results: list[dict], start_url: str) -> Path:
+    """Build an Excel workbook from platform suggestion results."""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Platform Suggestions"
+
+    # ── Styles ────────────────────────────────────────────────────────────────
+    header_fill = PatternFill("solid", fgColor="4F46E5")
+    header_font = Font(color="FFFFFF", bold=True, size=11)
+    center      = Alignment(horizontal="center", vertical="center")
+    wrap        = Alignment(wrap_text=True, vertical="top")
+    thin        = Side(style="thin", color="E5E7EB")
+    border      = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    PLATFORM_COLORS = {
+        "Website":             "DBEAFE",   # blue-100
+        "Maverick OneStop":    "FEF3C7",   # amber-100
+        "The Fountain":        "EDE9FE",   # violet-100
+        "MavLife / Student Hub": "D1FAE5", # green-100
+        "Teams / SharePoint":  "CCFBF1",   # teal-100
+        "No Clear Fit":        "F3F4F6",   # gray-100
+    }
+    CONFIDENCE_COLORS = {"High": "16A34A", "Medium": "D97706", "Low": "DC2626"}
+
+    headers = ["#", "Page Name", "Full URL", "Suggested Platform", "Confidence", "Reason", "Reviewer Override"]
+    for col, h in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col, value=h)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = center
+        cell.border = border
+    ws.row_dimensions[1].height = 22
+
+    for r in results:
+        row_num = r["index"] + 1
+        row_fill = PatternFill("solid", fgColor=PLATFORM_COLORS.get(r["platform"], "F3F4F6"))
+        conf_font = Font(color=CONFIDENCE_COLORS.get(r["confidence"], "374151"), bold=True)
+        values = [r["index"], r["page_name"], r["url"], r["platform"], r["confidence"], r["reason"], ""]
+        for col, val in enumerate(values, 1):
+            cell = ws.cell(row=row_num, column=col, value=val)
+            cell.fill = row_fill
+            cell.border = border
+            cell.alignment = wrap if col in (3, 6) else center
+            if col == 5:
+                cell.font = conf_font
+
+    widths = [5, 28, 55, 22, 14, 55, 28]
+    for col, w in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(col)].width = w
+    ws.freeze_panes = "A2"
+
+    # ── Summary sheet ─────────────────────────────────────────────────────────
+    ws2 = wb.create_sheet("Summary")
+    from collections import Counter
+    platform_counts = Counter(r["platform"] for r in results)
+    conf_counts     = Counter(r["confidence"] for r in results)
+    ws2["A1"], ws2["B1"] = "Starting URL", start_url
+    ws2["A2"], ws2["B2"] = "Total Pages Analyzed", len(results)
+    ws2["A3"], ws2["B3"] = "Exported At", datetime.now().isoformat(timespec="seconds")
+    row = 5
+    ws2.cell(row=row, column=1, value="Platform").font = Font(bold=True)
+    ws2.cell(row=row, column=2, value="Count").font   = Font(bold=True)
+    for platform, count in platform_counts.most_common():
+        row += 1
+        ws2.cell(row=row, column=1, value=platform)
+        ws2.cell(row=row, column=2, value=count)
+    row += 2
+    ws2.cell(row=row, column=1, value="Confidence").font = Font(bold=True)
+    ws2.cell(row=row, column=2, value="Count").font      = Font(bold=True)
+    for conf, count in conf_counts.most_common():
+        row += 1
+        ws2.cell(row=row, column=1, value=conf)
+        ws2.cell(row=row, column=2, value=count)
+    ws2.column_dimensions["A"].width = 28
+    ws2.column_dimensions["B"].width = 15
+
+    out_path = OUTPUT_DIR / "platform_suggestions.xlsx"
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    wb.save(out_path)
+    return out_path
+
+
 # ── routes ───────────────────────────────────────────────────────────────────
 
 @app.route("/")
@@ -461,6 +801,35 @@ def export_excel_route():
                 link["size_kb"]    = manifest[url].get("size_kb", "")
         path = export_excel(links, start_url)
         return send_file(str(path), as_attachment=True, download_name="scraped_pages.xlsx")
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/analyze-platforms", methods=["POST"])
+def analyze_platforms():
+    """Start a background platform-suggestion job for the given link list."""
+    data  = request.json or {}
+    links = data.get("links", [])
+    if not links:
+        return jsonify({"error": "No links provided"}), 400
+    job_id = str(uuid.uuid4())
+    q: queue.Queue = queue.Queue()
+    jobs[job_id] = {"type": "analysis", "queue": q, "analysis_results": None}
+    threading.Thread(target=_analysis_worker, args=(job_id, links, q), daemon=True).start()
+    return jsonify({"job_id": job_id})
+
+
+@app.route("/export-suggestions", methods=["POST"])
+def export_suggestions_route():
+    """Generate and return an Excel file from the platform suggestion results."""
+    data      = request.json or {}
+    results   = data.get("results", [])
+    start_url = data.get("start_url", "")
+    if not results:
+        return jsonify({"error": "No results provided"}), 400
+    try:
+        path = export_suggestions(results, start_url)
+        return send_file(str(path), as_attachment=True, download_name="platform_suggestions.xlsx")
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
