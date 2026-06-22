@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: mnsu-analyzer
+    env: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    healthCheckPath: /
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false          # set manually in Render dashboard (secret)
+      - key: ANALYSIS_CONCURRENCY
+        value: 3             # conservative for 512 MB free tier; raise to 6 on paid
+      - key: ALLOWED_ORIGIN
+        value: "*"           # update to your Vercel URL after first deploy,
+                             # e.g. https://mnsu-analyzer.vercel.app

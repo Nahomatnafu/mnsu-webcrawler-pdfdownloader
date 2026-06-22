@@ -97,11 +97,35 @@ TIER2_SYSTEM_BLOCKS = [
 ]
 
 # Concurrency + model settings for the AI analysis pipeline.
+# ANALYSIS_CONCURRENCY can be lowered via env var for memory-constrained hosts
+# (e.g. set to 3 on Render free tier: 512 MB RAM).
 TIER2_MODEL = "claude-haiku-4-5"
-ANALYSIS_CONCURRENCY = 6        # simultaneous page fetches + API calls
+ANALYSIS_CONCURRENCY = int(os.getenv("ANALYSIS_CONCURRENCY", "6"))
 SUGGEST_CACHE_DIR = Path("suggestion_cache")
 
 app = Flask(__name__)
+
+# ── CORS ─────────────────────────────────────────────────────────────────────
+# Allow any origin so a separately-deployed frontend (e.g. on Vercel) can call
+# this backend and open SSE streams.  No credentials are used, so * is safe.
+ALLOWED_ORIGIN = os.getenv("ALLOWED_ORIGIN", "*")
+
+@app.after_request
+def add_cors_headers(response):
+    response.headers["Access-Control-Allow-Origin"]  = ALLOWED_ORIGIN
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return response
+
+@app.route("/", defaults={"path": ""}, methods=["OPTIONS"])
+@app.route("/<path:path>", methods=["OPTIONS"])
+def handle_preflight(path):
+    """Return 200 for every CORS preflight so fetch() with JSON bodies works cross-origin."""
+    resp = app.make_default_options_response()
+    resp.headers["Access-Control-Allow-Origin"]  = ALLOWED_ORIGIN
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return resp
 jobs: dict = {}          # job_id -> {"type": "scrape"|"download", "queue": Queue, "links": list|None, "zip_path": str|None}
 
 OUTPUT_DIR = Path("mankato_pdfs")

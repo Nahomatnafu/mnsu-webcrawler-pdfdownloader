@@ -181,6 +181,12 @@
   </div><!-- /.app -->
 
   <script>
+    // ── Backend URL ───────────────────────────────────────────────────────────
+    // Leave empty for local dev (relative URLs).
+    // For production (Vercel frontend + Render backend), set to your Render URL,
+    // e.g. "https://mnsu-analyzer.onrender.com"  — no trailing slash.
+    const API_BASE = '';
+
     let scrapedLinks = [];
     let suggestionResults = [];
 
@@ -206,7 +212,7 @@
       btn.disabled = true;
       setStatus('Starting crawler…', true);
       try {
-        const res = await fetch('/scrape', {
+        const res = await fetch(`${API_BASE}/scrape`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ url })
         });
@@ -220,7 +226,7 @@
     }
 
     function listenToScrapeProgress(jobId) {
-      const es = new EventSource(`/progress/${jobId}`);
+      const es = new EventSource(`${API_BASE}/progress/${jobId}`);
       es.onmessage = (e) => {
         const evt = JSON.parse(e.data);
         if (evt.type === 'using_cache') {
@@ -288,12 +294,12 @@
       document.getElementById('dl-excel-btn').classList.add('hidden');
       switchTab('download');
 
-      const res = await fetch('/start-download', {
+      const res = await fetch(`${API_BASE}/start-download`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ links: newLinks })
       });
       const { job_id } = await res.json();
-      const es = new EventSource(`/progress/${job_id}`);
+      const es = new EventSource(`${API_BASE}/progress/${job_id}`);
       const progList = document.getElementById('progress-list');
       const bar = document.getElementById('progress-bar');
       const items = {};
@@ -341,7 +347,7 @@
       const btn = document.getElementById('dl-excel-btn');
       btn.disabled = true; btn.textContent = '⏳ Generating…';
       try {
-        const res = await fetch('/export-excel', {
+        const res = await fetch(`${API_BASE}/export-excel`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ links: scrapedLinks, start_url: document.getElementById('url-input').value.trim() })
         });
@@ -382,7 +388,7 @@
       document.getElementById('suggest-export-btn').classList.add('hidden');
       switchTab('suggest');
       try {
-        const res = await fetch('/analyze-platforms', {
+        const res = await fetch(`${API_BASE}/analyze-platforms`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ links: scrapedLinks })
         });
@@ -403,7 +409,7 @@
     }
 
     function listenToAnalysisProgress(jobId) {
-      const es = new EventSource(`/progress/${jobId}`);
+      const es = new EventSource(`${API_BASE}/progress/${jobId}`);
       const tbody  = document.getElementById('suggest-tbody');
       const bar    = document.getElementById('suggest-bar');
       const status = document.getElementById('suggest-status');
@@ -515,7 +521,7 @@
       const btn = document.getElementById('suggest-export-btn');
       btn.disabled = true; btn.textContent = '⏳ Generating…';
       try {
-        const res = await fetch('/export-suggestions', {
+        const res = await fetch(`${API_BASE}/export-suggestions`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ results: suggestionResults, start_url: document.getElementById('url-input').value.trim() })
         });
@@ -535,7 +541,7 @@
     async function clearManifest() {
       if (!confirm('Clear the download cache? You will re-download all pages.')) return;
       try {
-        const res = await fetch('/clear-manifest', { method: 'POST' });
+        const res = await fetch(`${API_BASE}/clear-manifest`, { method: 'POST' });
         const data = await res.json();
         if (data.status === 'cleared') {
           document.getElementById('cache-status').textContent = 'Cache cleared ✓';
