@@ -97,10 +97,21 @@ TIER2_SYSTEM_BLOCKS = [
 ]
 
 # Concurrency + model settings for the AI analysis pipeline.
-# ANALYSIS_CONCURRENCY can be lowered via env var for memory-constrained hosts
-# (e.g. set to 3 on Render free tier: 512 MB RAM).
+# ANALYSIS_CONCURRENCY caps how many pages are fetched + classified at once.
+# Each in-flight page is a live Chromium tab, so this is the main CPU/RAM dial.
+# Default 3 keeps a typical laptop responsive; raise on a beefy machine, lower
+# (e.g. 2) on memory-constrained hosts like the Render free tier (512 MB RAM).
 TIER2_MODEL = "claude-haiku-4-5"
-ANALYSIS_CONCURRENCY = int(os.getenv("ANALYSIS_CONCURRENCY", "6"))
+ANALYSIS_CONCURRENCY = int(os.getenv("ANALYSIS_CONCURRENCY", "3"))
+
+# Restart the shared Chromium browser every N page loads.  A single long-lived
+# context accumulates memory across thousands of navigations, which is what
+# freezes machines on large (~2000 link) runs.  Recycling caps peak RAM.
+ANALYSIS_BROWSER_RECYCLE = int(os.getenv("ANALYSIS_BROWSER_RECYCLE", "200"))
+
+# Per-page navigation timeout (ms) for the analysis fetch.
+ANALYSIS_NAV_TIMEOUT = int(os.getenv("ANALYSIS_NAV_TIMEOUT", "20000"))
+
 SUGGEST_CACHE_DIR = Path("suggestion_cache")
 
 # Safety ceiling on how many pages a single crawl will visit.  The BFS normally
@@ -574,63 +585,95 @@ async def _call_claude(client, page_name: str, url: str, excerpt: str) -> dict |
 
 
 async def _run_ai_analysis(results: list[dict], by_index: dict[int, dict], q: queue.Queue) -> None:
-    """Fetch + classify every page concurrently, streaming upgrades as each finishes."""
+    """
+    Fetch + classify every page, streaming upgrades as each finishes.
+
+    Memory safety for large (~2000 link) runs:
+      * Cached URLs never launch Chromium — they're emitted straight from disk.
+      * Uncached URLs are processed in bounded batches; the browser is fully
+        relaunched between batches so Chromium memory can't grow unbounded.
+      * Concurrency within a batch is capped by ANALYSIS_CONCURRENCY.
+    """
     total = len(results)
-    sem = asyncio.Semaphore(ANALYSIS_CONCURRENCY)
     client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+    done = 0
+
+    def _emit(res: dict) -> None:
+        """Stream one finished result (success or error) to the SSE queue."""
+        idx = res["index"]
+        if res.get("error"):
+            q.put({"type": "analysis_error", "index": idx, "reason": res["error"],
+                   "done": done, "total": total})
+            return
+        stored = by_index[idx]
+        stored.update(page_name=res["page_name"], platform=res["platform"],
+                      confidence=res["confidence"], reason=res["reason"], tier=2)
+        q.put({"type": "analysis_upgrade", "index": idx, "page_name": res["page_name"],
+               "platform": res["platform"], "confidence": res["confidence"],
+               "reason": res["reason"], "cached": res.get("cached", False),
+               "done": done, "total": total})
+
+    # ── 1. Serve cached results instantly (no browser involved) ───────────────
+    uncached: list[dict] = []
+    for r in results:
+        cached = _load_suggest_cache(r["url"])
+        if cached:
+            done += 1
+            _emit({"index": r["index"], **cached, "cached": True})
+        else:
+            uncached.append(r)
+
+    if not uncached:
+        return
+
+    # ── 2. Process uncached URLs in browser-recycling batches ─────────────────
+    sem = asyncio.Semaphore(ANALYSIS_CONCURRENCY)
+    batch_size = max(ANALYSIS_BROWSER_RECYCLE, ANALYSIS_CONCURRENCY)
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(args=["--no-sandbox", "--disable-setuid-sandbox"])
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 AppleWebKit/537.36 Chrome/120 Safari/537.36"
-        )
+        for start in range(0, len(uncached), batch_size):
+            batch = uncached[start:start + batch_size]
 
-        async def analyze_one(result: dict) -> dict:
-            idx, url = result["index"], result["url"]
-            cached = _load_suggest_cache(url)
-            if cached:
-                return {"index": idx, **cached, "cached": True}
+            # Fresh browser per batch → peak memory resets every batch.
+            browser = await pw.chromium.launch(
+                args=["--no-sandbox", "--disable-setuid-sandbox"])
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 AppleWebKit/537.36 Chrome/120 Safari/537.36"
+            )
 
-            async with sem:
-                page = await context.new_page()
-                try:
-                    await page.goto(url, wait_until="domcontentloaded", timeout=20_000)
-                    title = (await page.title()).strip()
-                    raw_text = await page.inner_text("body")
-                except Exception as e:
-                    return {"index": idx, "error": str(e)}
-                finally:
-                    await page.close()
+            async def analyze_one(result: dict) -> dict:
+                idx, url = result["index"], result["url"]
+                async with sem:
+                    page = await context.new_page()
+                    try:
+                        await page.goto(url, wait_until="domcontentloaded",
+                                        timeout=ANALYSIS_NAV_TIMEOUT)
+                        title = (await page.title()).strip()
+                        raw_text = await page.inner_text("body")
+                    except Exception as e:
+                        return {"index": idx, "error": str(e)}
+                    finally:
+                        await page.close()
 
-                excerpt = " ".join(raw_text.split()[:600])
-                page_name = title or result["page_name"]
-                ai = await _call_claude(client, page_name, url, excerpt)
+                    excerpt = " ".join(raw_text.split()[:600])
+                    page_name = title or result["page_name"]
+                    ai = await _call_claude(client, page_name, url, excerpt)
 
-            if ai is None:
-                return {"index": idx, "error": "AI classification failed"}
-            out = {"page_name": page_name, **ai}
-            _save_suggest_cache(url, out)
-            return {"index": idx, **out}
+                if ai is None:
+                    return {"index": idx, "error": "AI classification failed"}
+                out = {"page_name": page_name, **ai}
+                _save_suggest_cache(url, out)
+                return {"index": idx, **out}
 
-        tasks = [asyncio.create_task(analyze_one(r)) for r in results]
-        done = 0
-        for fut in asyncio.as_completed(tasks):
-            res = await fut
-            done += 1
-            idx = res["index"]
-            if res.get("error"):
-                q.put({"type": "analysis_error", "index": idx, "reason": res["error"],
-                       "done": done, "total": total})
-                continue
-            stored = by_index[idx]
-            stored.update(page_name=res["page_name"], platform=res["platform"],
-                          confidence=res["confidence"], reason=res["reason"], tier=2)
-            q.put({"type": "analysis_upgrade", "index": idx, "page_name": res["page_name"],
-                   "platform": res["platform"], "confidence": res["confidence"],
-                   "reason": res["reason"], "cached": res.get("cached", False),
-                   "done": done, "total": total})
-
-        await browser.close()
+            try:
+                tasks = [asyncio.create_task(analyze_one(r)) for r in batch]
+                for fut in asyncio.as_completed(tasks):
+                    res = await fut
+                    done += 1
+                    _emit(res)
+            finally:
+                await context.close()
+                await browser.close()
 
 
 def _analysis_worker(job_id: str, links: list[dict], q: queue.Queue) -> None:
