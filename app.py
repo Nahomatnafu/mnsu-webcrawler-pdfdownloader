@@ -122,7 +122,8 @@ ANALYSIS_CONCURRENCY = env_int("ANALYSIS_CONCURRENCY", 2, 1)
 ANALYSIS_BROWSER_RECYCLE = env_int("ANALYSIS_BROWSER_RECYCLE", 100, 1)
 
 # Per-page navigation timeout (ms) for the analysis fetch.
-ANALYSIS_NAV_TIMEOUT = env_int("ANALYSIS_NAV_TIMEOUT", 20000, 1000)
+ANALYSIS_NAV_TIMEOUT = env_int("ANALYSIS_NAV_TIMEOUT", 15000, 1000)
+CRAWL_NAV_TIMEOUT = env_int("CRAWL_NAV_TIMEOUT", 10000, 1000)
 PDF_NAV_TIMEOUT = env_int("PDF_NAV_TIMEOUT", 20000, 1000)
 PDF_SETTLE_MS = env_int("PDF_SETTLE_MS", 750, 0)
 SSE_HEARTBEAT_SECONDS = env_int("SSE_HEARTBEAT_SECONDS", 20, 5)
@@ -197,6 +198,32 @@ def finish_job(job_id: str) -> None:
 def emit_terminal(q: queue.Queue, job_id: str, event: dict) -> None:
     finish_job(job_id)
     q.put(event)
+
+
+HEAVY_RESOURCE_TYPES = {"image", "media", "font"}
+BLOCKED_URL_PARTS = ("googletagmanager", "google-analytics", "doubleclick", "hotjar", "fullstory")
+
+
+def should_block_resource(request, include_stylesheets: bool = False) -> bool:
+    if request.resource_type in HEAVY_RESOURCE_TYPES:
+        return True
+    if include_stylesheets and request.resource_type == "stylesheet":
+        return True
+    return any(part in request.url.lower() for part in BLOCKED_URL_PARTS)
+
+
+def block_resource_route(route, include_stylesheets: bool = False) -> None:
+    if should_block_resource(route.request, include_stylesheets):
+        route.abort()
+    else:
+        route.continue_()
+
+
+async def block_resource_route_async(route, include_stylesheets: bool = False) -> None:
+    if should_block_resource(route.request, include_stylesheets):
+        await route.abort()
+    else:
+        await route.continue_()
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -317,9 +344,11 @@ def _scrape_worker(job_id: str, start_url: str, q: queue.Queue,
 
         with sync_playwright() as pw:
             browser = pw.chromium.launch(args=["--no-sandbox", "--disable-setuid-sandbox"])
-            page = browser.new_context(
+            context = browser.new_context(
                 user_agent="Mozilla/5.0 AppleWebKit/537.36 Chrome/120 Safari/537.36"
-            ).new_page()
+            )
+            context.route("**/*", lambda route: block_resource_route(route, True))
+            page = context.new_page()
             try:
                 while to_visit and len(visited) < max_pages:
                     url = to_visit.pop(0)
@@ -337,7 +366,7 @@ def _scrape_worker(job_id: str, start_url: str, q: queue.Queue,
                         page.goto(url, wait_until="domcontentloaded", timeout=20_000)
                     except Exception:
                         try:
-                            page.goto(url, wait_until="domcontentloaded", timeout=20_000)
+                            page.goto(url, wait_until="domcontentloaded", timeout=CRAWL_NAV_TIMEOUT)
                         except Exception as e:
                             skipped += 1
                             q.put({"type": "skipped", "url": url,
@@ -381,9 +410,11 @@ def _pdf_worker(job_id: str, links: list[str], q: queue.Queue) -> None:
     try:
         with sync_playwright() as pw:
             browser = pw.chromium.launch(args=["--no-sandbox", "--disable-setuid-sandbox"])
-            page = browser.new_context(
+            context = browser.new_context(
                 user_agent="Mozilla/5.0 AppleWebKit/537.36 Chrome/120 Safari/537.36"
-            ).new_page()
+            )
+            context.route("**/*", lambda route: block_resource_route(route))
+            page = context.new_page()
 
             for i, url in enumerate(links, 1):
                 # Skip URLs already in the manifest
@@ -690,6 +721,7 @@ async def _run_ai_analysis(results: list[dict], by_index: dict[int, dict], q: qu
             context = await browser.new_context(
                 user_agent="Mozilla/5.0 AppleWebKit/537.36 Chrome/120 Safari/537.36"
             )
+            await context.route("**/*", lambda route: block_resource_route_async(route, True))
 
             async def analyze_one(result: dict) -> dict:
                 idx, url = result["index"], result["url"]

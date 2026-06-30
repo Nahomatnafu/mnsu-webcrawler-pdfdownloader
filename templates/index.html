@@ -231,7 +231,8 @@
           setStatus(`✓ Loaded ${evt.count} cached links instantly!`);
         }
         if (evt.type === 'crawling') {
-          setStatus(`Crawling… found ${evt.count} page${evt.count !== 1 ? 's' : ''} so far.`, true);
+          const current = evt.url ? ` — ${evt.url.replace(/^https?:\/\//, '').slice(0, 90)}` : '';
+          setStatus(`Crawling… visited ${evt.count} page${evt.count !== 1 ? 's' : ''}${current}`, true);
         }
         if (evt.type === 'complete') {
           scrapedLinks = evt.links;
