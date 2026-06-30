@@ -182,10 +182,8 @@
 
   <script>
     // ── Backend URL ───────────────────────────────────────────────────────────
-    // Leave empty for local dev (relative URLs).
-    // For production (Vercel frontend + Render backend), set to your Render URL,
-    // e.g. "https://mnsu-analyzer.onrender.com"  — no trailing slash.
-    const API_BASE = '';
+    // Leave empty when Flask serves the frontend and API from the same Railway service.
+    const API_BASE = (window.API_BASE || '').replace(/\/$/, '');
 
     let scrapedLinks = [];
     let suggestionResults = [];
@@ -299,7 +297,13 @@
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ links: newLinks })
       });
-      const { job_id } = await res.json();
+      const data = await res.json();
+      if (data.error) {
+        document.getElementById('progress-label').textContent = 'Error: ' + data.error;
+        document.getElementById('download-btn').disabled = false;
+        return;
+      }
+      const job_id = data.job_id;
       const es = new EventSource(`${API_BASE}/progress/${job_id}`);
       const progList = document.getElementById('progress-list');
       const bar = document.getElementById('progress-bar');
@@ -332,7 +336,7 @@
           bar.style.width = '100%';
           document.getElementById('progress-label').textContent = 'All PDFs ready!';
           const dlBtn = document.getElementById('dl-zip-btn');
-          dlBtn.href = `/get-zip/${job_id}`; dlBtn.classList.remove('hidden');
+          dlBtn.href = `${API_BASE}/get-zip/${job_id}`; dlBtn.classList.remove('hidden');
           document.getElementById('dl-excel-btn').classList.remove('hidden');
           document.getElementById('download-btn').disabled = false;
           es.close();

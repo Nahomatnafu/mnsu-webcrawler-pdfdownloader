@@ -102,22 +102,40 @@ TIER2_SYSTEM_BLOCKS = [
 # Default 3 keeps a typical laptop responsive; raise on a beefy machine, lower
 # (e.g. 2) on memory-constrained hosts like the Render free tier (512 MB RAM).
 TIER2_MODEL = "claude-haiku-4-5"
-ANALYSIS_CONCURRENCY = int(os.getenv("ANALYSIS_CONCURRENCY", "3"))
+
+
+def env_int(name: str, default: int, minimum: int | None = None) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    if minimum is not None:
+        value = max(value, minimum)
+    return value
+
+
+ANALYSIS_CONCURRENCY = env_int("ANALYSIS_CONCURRENCY", 2, 1)
 
 # Restart the shared Chromium browser every N page loads.  A single long-lived
 # context accumulates memory across thousands of navigations, which is what
 # freezes machines on large (~2000 link) runs.  Recycling caps peak RAM.
-ANALYSIS_BROWSER_RECYCLE = int(os.getenv("ANALYSIS_BROWSER_RECYCLE", "200"))
+ANALYSIS_BROWSER_RECYCLE = env_int("ANALYSIS_BROWSER_RECYCLE", 100, 1)
 
 # Per-page navigation timeout (ms) for the analysis fetch.
-ANALYSIS_NAV_TIMEOUT = int(os.getenv("ANALYSIS_NAV_TIMEOUT", "20000"))
+ANALYSIS_NAV_TIMEOUT = env_int("ANALYSIS_NAV_TIMEOUT", 20000, 1000)
+PDF_NAV_TIMEOUT = env_int("PDF_NAV_TIMEOUT", 20000, 1000)
+PDF_SETTLE_MS = env_int("PDF_SETTLE_MS", 750, 0)
+SSE_HEARTBEAT_SECONDS = env_int("SSE_HEARTBEAT_SECONDS", 20, 5)
+MAX_ACTIVE_JOBS = env_int("MAX_ACTIVE_JOBS", 2, 1)
+JOB_RETENTION_SECONDS = env_int("JOB_RETENTION_SECONDS", 3600, 60)
 
-SUGGEST_CACHE_DIR = Path("suggestion_cache")
+DATA_DIR = Path(os.getenv("DATA_DIR", tempfile.gettempdir() if os.getenv("RAILWAY_ENVIRONMENT") else "."))
+SUGGEST_CACHE_DIR = DATA_DIR / "suggestion_cache"
 
 # Safety ceiling on how many pages a single crawl will visit.  The BFS normally
 # stops on its own once it exhausts the in-scope queue; this only caps runaway
 # crawls.  Default is well above large sections so full coverage isn't truncated.
-CRAWL_MAX_PAGES = int(os.getenv("CRAWL_MAX_PAGES", "2000"))
+CRAWL_MAX_PAGES = env_int("CRAWL_MAX_PAGES", 1000, 1)
 
 app = Flask(__name__)
 
@@ -143,10 +161,42 @@ def handle_preflight(path):
     resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
     return resp
 jobs: dict = {}          # job_id -> {"type": "scrape"|"download", "queue": Queue, "links": list|None, "zip_path": str|None}
+jobs_lock = threading.Lock()
 
-OUTPUT_DIR = Path("mankato_pdfs")
+OUTPUT_DIR = DATA_DIR / "mankato_pdfs"
 MANIFEST_PATH = OUTPUT_DIR / "manifest.json"
-CRAWL_CACHE_DIR = Path("crawl_cache")  # Cache crawl results by starting URL
+CRAWL_CACHE_DIR = DATA_DIR / "crawl_cache"  # Cache crawl results by starting URL
+
+
+def cleanup_jobs() -> None:
+    cutoff = time.time() - JOB_RETENTION_SECONDS
+    with jobs_lock:
+        for job_id, job in list(jobs.items()):
+            if job.get("finished_at", 0) and job["finished_at"] < cutoff:
+                jobs.pop(job_id, None)
+
+
+def register_job(job_id: str, job: dict) -> bool:
+    cleanup_jobs()
+    with jobs_lock:
+        active = sum(1 for item in jobs.values() if not item.get("finished_at"))
+        if active >= MAX_ACTIVE_JOBS:
+            return False
+        job["created_at"] = time.time()
+        jobs[job_id] = job
+        return True
+
+
+def finish_job(job_id: str) -> None:
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if job and not job.get("finished_at"):
+            job["finished_at"] = time.time()
+
+
+def emit_terminal(q: queue.Queue, job_id: str, event: dict) -> None:
+    finish_job(job_id)
+    q.put(event)
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -252,7 +302,7 @@ def _scrape_worker(job_id: str, start_url: str, q: queue.Queue,
                 }
                 for l in cached_links
             ]
-            q.put({"type": "complete", "links": links_with_status})
+            emit_terminal(q, job_id, {"type": "complete", "links": links_with_status})
             return
 
         # No cache — crawl normally
@@ -317,10 +367,10 @@ def _scrape_worker(job_id: str, start_url: str, q: queue.Queue,
             }
             for l in all_found_sorted
         ]
-        q.put({"type": "complete", "links": links_with_status,
-               "visited": len(visited), "skipped": skipped})
+        emit_terminal(q, job_id, {"type": "complete", "links": links_with_status,
+                                  "visited": len(visited), "skipped": skipped})
     except Exception as e:
-        q.put({"type": "fatal", "reason": str(e)})
+        emit_terminal(q, job_id, {"type": "fatal", "reason": str(e)})
 
 
 def _pdf_worker(job_id: str, links: list[str], q: queue.Queue) -> None:
@@ -351,8 +401,8 @@ def _pdf_worker(job_id: str, links: list[str], q: queue.Queue) -> None:
                 try:
                     # Use screen media so the page renders like a real browser
                     page.emulate_media(media="screen")
-                    page.goto(url, wait_until="networkidle", timeout=30_000)
-                    page.wait_for_timeout(500)
+                    page.goto(url, wait_until="domcontentloaded", timeout=PDF_NAV_TIMEOUT)
+                    page.wait_for_timeout(PDF_SETTLE_MS)
 
                     # Surgically remove only elements known to break multi-page PDFs.
                     # DO NOT use * { position: static } — it collapses the entire layout.
@@ -422,17 +472,17 @@ def _pdf_worker(job_id: str, links: list[str], q: queue.Queue) -> None:
 
         # Zip preserving the folder structure
         q.put({"type": "status", "message": "Creating ZIP file..."})
-        zip_path = OUTPUT_DIR / "pages.zip"
+        zip_path = OUTPUT_DIR / f"pages-{job_id}.zip"
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             for i, p in enumerate(pdf_paths, 1):
                 zf.write(p, p.relative_to(OUTPUT_DIR))
                 if i % 20 == 0:  # Status update every 20 files
                     q.put({"type": "status", "message": f"Compressing ZIP… {i}/{len(pdf_paths)}"})
         jobs[job_id]["zip_path"] = str(zip_path)
-        q.put({"type": "complete"})
+        emit_terminal(q, job_id, {"type": "complete"})
 
     except Exception as e:
-        q.put({"type": "fatal", "reason": str(e)})
+        emit_terminal(q, job_id, {"type": "fatal", "reason": str(e)})
 
 
 def export_excel(links: list[dict], start_url: str) -> Path:
@@ -515,7 +565,7 @@ def export_excel(links: list[dict], start_url: str) -> Path:
     ws2.column_dimensions["A"].width = 22
     ws2.column_dimensions["B"].width = 70
 
-    out_path = OUTPUT_DIR / "scraped_pages.xlsx"
+    out_path = OUTPUT_DIR / f"scraped_pages_{uuid.uuid4().hex}.xlsx"
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     wb.save(out_path)
     return out_path
@@ -707,8 +757,8 @@ def _analysis_worker(job_id: str, links: list[dict], q: queue.Queue) -> None:
             q.put({"type": "analysis_placeholder", **result})
 
         if not ANTHROPIC_API_KEY:
-            q.put({"type": "fatal",
-                   "reason": "No ANTHROPIC_API_KEY set — add it to .env to enable AI analysis."})
+            emit_terminal(q, job_id, {"type": "fatal",
+                                      "reason": "No ANTHROPIC_API_KEY set — add it to .env to enable AI analysis."})
             return
 
         # ── AI analysis (async, concurrent) ───────────────────────────────────
@@ -716,9 +766,9 @@ def _analysis_worker(job_id: str, links: list[dict], q: queue.Queue) -> None:
         asyncio.run(_run_ai_analysis(results, by_index, q))
 
         jobs[job_id]["analysis_results"] = results
-        q.put({"type": "analysis_complete", "total": total})
+        emit_terminal(q, job_id, {"type": "analysis_complete", "total": total})
     except Exception as e:
-        q.put({"type": "fatal", "reason": str(e)})
+        emit_terminal(q, job_id, {"type": "fatal", "reason": str(e)})
 
 
 def export_suggestions(results: list[dict], start_url: str) -> Path:
@@ -797,7 +847,7 @@ def export_suggestions(results: list[dict], start_url: str) -> Path:
     ws2.column_dimensions["A"].width = 28
     ws2.column_dimensions["B"].width = 15
 
-    out_path = OUTPUT_DIR / "platform_suggestions.xlsx"
+    out_path = OUTPUT_DIR / f"platform_suggestions_{uuid.uuid4().hex}.xlsx"
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     wb.save(out_path)
     return out_path
@@ -810,6 +860,11 @@ def index():
     return render_template("index.html")
 
 
+@app.route("/healthz")
+def healthz():
+    return jsonify({"status": "ok"})
+
+
 @app.route("/scrape", methods=["POST"])
 def scrape():
     body = request.json or {}
@@ -820,7 +875,8 @@ def scrape():
 
     job_id = str(uuid.uuid4())
     q: queue.Queue = queue.Queue()
-    jobs[job_id] = {"type": "scrape", "queue": q, "links": None, "zip_path": None}
+    if not register_job(job_id, {"type": "scrape", "queue": q, "links": None, "zip_path": None}):
+        return jsonify({"error": "Too many active jobs. Wait for the current job to finish, then try again."}), 429
     threading.Thread(target=_scrape_worker, args=(job_id, url, q),
                      kwargs={"refresh": refresh}, daemon=True).start()
     return jsonify({"job_id": job_id})
@@ -833,7 +889,8 @@ def start_download():
         return jsonify({"error": "No links provided"}), 400
     job_id = str(uuid.uuid4())
     q: queue.Queue = queue.Queue()
-    jobs[job_id] = {"queue": q, "zip_path": None}
+    if not register_job(job_id, {"type": "download", "queue": q, "zip_path": None}):
+        return jsonify({"error": "Too many active jobs. Wait for the current job to finish, then try again."}), 429
     threading.Thread(target=_pdf_worker, args=(job_id, links, q), daemon=True).start()
     return jsonify({"job_id": job_id})
 
@@ -848,12 +905,12 @@ def progress(job_id: str):
         q = job["queue"]
         while True:
             try:
-                evt = q.get(timeout=90)
-                # Store links if this is a scrape job
+                evt = q.get(timeout=SSE_HEARTBEAT_SECONDS)
                 if evt.get("type") == "complete" and job.get("type") == "scrape":
                     job["links"] = evt.get("links", [])
                 yield f"data: {json.dumps(evt)}\n\n"
                 if evt.get("type") in ("complete", "fatal"):
+                    job["finished_at"] = time.time()
                     break
             except queue.Empty:
                 yield 'data: {"type":"heartbeat"}\n\n'
@@ -903,7 +960,8 @@ def analyze_platforms():
         return jsonify({"error": "No links provided"}), 400
     job_id = str(uuid.uuid4())
     q: queue.Queue = queue.Queue()
-    jobs[job_id] = {"type": "analysis", "queue": q, "analysis_results": None}
+    if not register_job(job_id, {"type": "analysis", "queue": q, "analysis_results": None}):
+        return jsonify({"error": "Too many active jobs. Wait for the current job to finish, then try again."}), 429
     threading.Thread(target=_analysis_worker, args=(job_id, links, q), daemon=True).start()
     return jsonify({"job_id": job_id})
 
@@ -935,4 +993,9 @@ def clear_manifest():
 
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5000, threaded=True)
+    app.run(
+        debug=os.getenv("FLASK_DEBUG") == "1",
+        host="0.0.0.0",
+        port=env_int("PORT", 5000, 1),
+        threaded=True,
+    )
