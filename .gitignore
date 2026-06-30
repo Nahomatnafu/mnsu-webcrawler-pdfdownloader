@@ -39,6 +39,7 @@ ENV/
 mankato_pdfs/
 crawl_cache/
 suggestion_cache/
+logs/
 *.pdf
 pages.zip
 manifest.json

@@ -5,10 +5,11 @@ Run:  python app.py
 Open: http://localhost:5000
 """
 
-import asyncio, hashlib, json, os, queue, re, tempfile, threading, time, uuid, zipfile
+import asyncio, hashlib, html, json, os, queue, re, tempfile, threading, time, uuid, zipfile
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
+from urllib.request import Request, urlopen
 
 import anthropic
 import openpyxl
@@ -303,23 +304,33 @@ def save_crawl_cache(start_url: str, links: list) -> None:
         json.dump(links, f, indent=2)
 
 
-def _extract_sublinks(page, start_url: str, base: str, domain: str) -> set[str]:
-    """Extract all sublinks from the current page that are within base path."""
+def _fetch_html(url: str) -> str:
+    req = Request(url, headers={
+        "User-Agent": "Mozilla/5.0 AppleWebKit/537.36 Chrome/120 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    })
+    with urlopen(req, timeout=CRAWL_NAV_TIMEOUT / 1000) as response:
+        content_type = response.headers.get("content-type", "")
+        if "html" not in content_type.lower():
+            return ""
+        raw = response.read(2_000_000)
+        charset = response.headers.get_content_charset() or "utf-8"
+        return raw.decode(charset, errors="ignore")
+
+
+def _extract_sublinks_from_html(markup: str, start_url: str, base: str, domain: str) -> set[str]:
     found = set()
-    for a in page.query_selector_all("a[href]"):
-        href = a.get_attribute("href") or ""
+    for match in re.finditer(r'''href\s*=\s*["']([^"'#]+)["']''', markup, flags=re.I):
+        href = html.unescape(match.group(1)).strip()
+        if not href or href.startswith(("mailto:", "tel:", "javascript:")):
+            continue
         abs_url = urljoin(start_url, href)
         p2 = urlparse(abs_url)
         clean = f"{p2.scheme}://{p2.netloc}{p2.path}"
         clean_path = p2.path.rstrip("/")
-
-        # Skip broken/redirect links (SharePoint ~/link/hash.aspx pattern)
         if "~/link/" in clean_path:
             continue
-
-        if p2.netloc == domain and (
-            clean_path == base or clean_path.startswith(base + "/")
-        ):
+        if p2.netloc == domain and (clean_path == base or clean_path.startswith(base + "/")):
             found.add(clean)
     return found
 
@@ -359,62 +370,48 @@ def _scrape_worker(job_id: str, start_url: str, q: queue.Queue,
         log_job(job_id, "crawl started", start_url=start_url, max_pages=max_pages, timeout_ms=CRAWL_NAV_TIMEOUT)
         update_job_status(job_id, stage="starting", current_url=start_url, visited=0, found=0, queued=1, skipped=0)
 
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(args=["--no-sandbox", "--disable-setuid-sandbox"])
-            context = browser.new_context(
-                user_agent="Mozilla/5.0 AppleWebKit/537.36 Chrome/120 Safari/537.36"
-            )
-            context.route("**/*", lambda route: block_resource_route(route, True))
-            page = context.new_page()
+        while to_visit and len(visited) < max_pages:
+            url = to_visit.pop(0)
+            if url in visited:
+                continue
+            visited.add(url)
+
+            elapsed = round(time.time() - started_at, 1)
+            status = {"type": "crawling", "url": url, "count": len(visited),
+                      "found": len(all_found), "queued": len(to_visit),
+                      "skipped": skipped, "elapsed": elapsed, "stage": "loading"}
+            update_job_status(job_id, stage="loading", current_url=url, visited=len(visited),
+                              found=len(all_found), queued=len(to_visit), skipped=skipped, elapsed=elapsed)
+            log_job(job_id, "loading page", visited=len(visited), found=len(all_found), queued=len(to_visit), url=url)
+            q.put(status)
+
             try:
-                while to_visit and len(visited) < max_pages:
-                    url = to_visit.pop(0)
-                    if url in visited:
-                        continue
-                    visited.add(url)
+                markup = _fetch_html(url)
+            except Exception as e:
+                skipped += 1
+                reason = str(e).splitlines()[0][:180]
+                update_job_status(job_id, stage="skipped", current_url=url, visited=len(visited),
+                                  found=len(all_found), queued=len(to_visit), skipped=skipped,
+                                  last_error=reason, elapsed=round(time.time() - started_at, 1))
+                log_job(job_id, "skipped page", url=url, reason=reason)
+                q.put({"type": "skipped", "url": url, "count": len(visited),
+                       "found": len(all_found), "queued": len(to_visit),
+                       "skipped": skipped, "reason": reason})
+                continue
 
-                    elapsed = round(time.time() - started_at, 1)
-                    status = {"type": "crawling", "url": url, "count": len(visited),
-                              "found": len(all_found), "queued": len(to_visit),
-                              "skipped": skipped, "elapsed": elapsed, "stage": "loading"}
-                    update_job_status(job_id, stage="loading", current_url=url, visited=len(visited),
-                                      found=len(all_found), queued=len(to_visit), skipped=skipped, elapsed=elapsed)
-                    log_job(job_id, "loading page", visited=len(visited), found=len(all_found), queued=len(to_visit), url=url)
-                    q.put(status)
+            update_job_status(job_id, stage="extracting", current_url=url, visited=len(visited),
+                              found=len(all_found), queued=len(to_visit), skipped=skipped,
+                              elapsed=round(time.time() - started_at, 1))
+            new_links = _extract_sublinks_from_html(markup, url, base, domain)
+            all_found.update(new_links)
+            log_job(job_id, "extracted links", url=url, new_links=len(new_links), total_found=len(all_found))
 
-                    try:
-                        page.goto(url, wait_until="domcontentloaded", timeout=CRAWL_NAV_TIMEOUT)
-                    except Exception:
-                        try:
-                            log_job(job_id, "retrying page", url=url)
-                            page.goto(url, wait_until="domcontentloaded", timeout=CRAWL_NAV_TIMEOUT)
-                        except Exception as e:
-                            skipped += 1
-                            reason = str(e).splitlines()[0][:180]
-                            update_job_status(job_id, stage="skipped", current_url=url, visited=len(visited),
-                                              found=len(all_found), queued=len(to_visit), skipped=skipped,
-                                              last_error=reason, elapsed=round(time.time() - started_at, 1))
-                            log_job(job_id, "skipped page", url=url, reason=reason)
-                            q.put({"type": "skipped", "url": url, "count": len(visited),
-                                   "found": len(all_found), "queued": len(to_visit),
-                                   "skipped": skipped, "reason": reason})
-                            continue
-
-                    update_job_status(job_id, stage="extracting", current_url=url, visited=len(visited),
-                                      found=len(all_found), queued=len(to_visit), skipped=skipped,
-                                      elapsed=round(time.time() - started_at, 1))
-                    new_links = _extract_sublinks(page, url, base, domain)
-                    all_found.update(new_links)
-                    log_job(job_id, "extracted links", url=url, new_links=len(new_links), total_found=len(all_found))
-
-                    for link in new_links:
-                        if link not in visited and link not in to_visit:
-                            to_visit.append(link)
-                    update_job_status(job_id, stage="queued", current_url=url, visited=len(visited),
-                                      found=len(all_found), queued=len(to_visit), skipped=skipped,
-                                      elapsed=round(time.time() - started_at, 1))
-            finally:
-                browser.close()
+            for link in new_links:
+                if link not in visited and link not in to_visit:
+                    to_visit.append(link)
+            update_job_status(job_id, stage="queued", current_url=url, visited=len(visited),
+                              found=len(all_found), queued=len(to_visit), skipped=skipped,
+                              elapsed=round(time.time() - started_at, 1))
 
         # Save crawl results to cache
         all_found_sorted = sorted(all_found)
