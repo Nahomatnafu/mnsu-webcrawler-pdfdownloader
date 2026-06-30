@@ -232,7 +232,12 @@
         }
         if (evt.type === 'crawling') {
           const current = evt.url ? ` — ${evt.url.replace(/^https?:\/\//, '').slice(0, 90)}` : '';
-          setStatus(`Crawling… visited ${evt.count} page${evt.count !== 1 ? 's' : ''}${current}`, true);
+          const stats = `visited ${evt.count || 0} · found ${evt.found || 0} · queued ${evt.queued || 0} · skipped ${evt.skipped || 0} · ${evt.elapsed || 0}s`;
+          setStatus(`Crawling… ${stats}${current}`, true);
+        }
+        if (evt.type === 'skipped') {
+          const current = evt.url ? ` — ${evt.url.replace(/^https?:\/\//, '').slice(0, 90)}` : '';
+          setStatus(`Skipped ${evt.skipped || 0} page${(evt.skipped || 0) !== 1 ? 's' : ''}; continuing crawl${current}`, true);
         }
         if (evt.type === 'complete') {
           scrapedLinks = evt.links;

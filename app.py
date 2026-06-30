@@ -188,6 +188,19 @@ def register_job(job_id: str, job: dict) -> bool:
         return True
 
 
+def update_job_status(job_id: str, **status) -> None:
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if job:
+            current = job.setdefault("status", {})
+            current.update(status, updated_at=time.time())
+
+
+def log_job(job_id: str, message: str, **details) -> None:
+    detail_text = " ".join(f"{key}={value}" for key, value in details.items())
+    print(f"[job:{job_id}] {message} {detail_text}".rstrip(), flush=True)
+
+
 def finish_job(job_id: str) -> None:
     with jobs_lock:
         job = jobs.get(job_id)
@@ -196,6 +209,7 @@ def finish_job(job_id: str) -> None:
 
 
 def emit_terminal(q: queue.Queue, job_id: str, event: dict) -> None:
+    update_job_status(job_id, stage=event.get("type"), terminal=True)
     finish_job(job_id)
     q.put(event)
 
@@ -341,6 +355,9 @@ def _scrape_worker(job_id: str, start_url: str, q: queue.Queue,
         to_visit: list[str] = [start_url.rstrip("/") + "/"]
         all_found: set[str] = set()
         skipped = 0
+        started_at = time.time()
+        log_job(job_id, "crawl started", start_url=start_url, max_pages=max_pages, timeout_ms=CRAWL_NAV_TIMEOUT)
+        update_job_status(job_id, stage="starting", current_url=start_url, visited=0, found=0, queued=1, skipped=0)
 
         with sync_playwright() as pw:
             browser = pw.chromium.launch(args=["--no-sandbox", "--disable-setuid-sandbox"])
@@ -356,29 +373,46 @@ def _scrape_worker(job_id: str, start_url: str, q: queue.Queue,
                         continue
                     visited.add(url)
 
-                    q.put({"type": "crawling", "url": url, "count": len(visited)})
+                    elapsed = round(time.time() - started_at, 1)
+                    status = {"type": "crawling", "url": url, "count": len(visited),
+                              "found": len(all_found), "queued": len(to_visit),
+                              "skipped": skipped, "elapsed": elapsed, "stage": "loading"}
+                    update_job_status(job_id, stage="loading", current_url=url, visited=len(visited),
+                                      found=len(all_found), queued=len(to_visit), skipped=skipped, elapsed=elapsed)
+                    log_job(job_id, "loading page", visited=len(visited), found=len(all_found), queued=len(to_visit), url=url)
+                    q.put(status)
 
-                    # domcontentloaded is reliable for link extraction — we only
-                    # need the parsed DOM, not full network idle (many MNSU pages
-                    # never go idle due to analytics/chat scripts).  Retry once on
-                    # a transient failure, then surface (don't swallow) the skip.
                     try:
-                        page.goto(url, wait_until="domcontentloaded", timeout=20_000)
+                        page.goto(url, wait_until="domcontentloaded", timeout=CRAWL_NAV_TIMEOUT)
                     except Exception:
                         try:
+                            log_job(job_id, "retrying page", url=url)
                             page.goto(url, wait_until="domcontentloaded", timeout=CRAWL_NAV_TIMEOUT)
                         except Exception as e:
                             skipped += 1
-                            q.put({"type": "skipped", "url": url,
-                                   "reason": str(e).splitlines()[0][:140]})
+                            reason = str(e).splitlines()[0][:180]
+                            update_job_status(job_id, stage="skipped", current_url=url, visited=len(visited),
+                                              found=len(all_found), queued=len(to_visit), skipped=skipped,
+                                              last_error=reason, elapsed=round(time.time() - started_at, 1))
+                            log_job(job_id, "skipped page", url=url, reason=reason)
+                            q.put({"type": "skipped", "url": url, "count": len(visited),
+                                   "found": len(all_found), "queued": len(to_visit),
+                                   "skipped": skipped, "reason": reason})
                             continue
 
+                    update_job_status(job_id, stage="extracting", current_url=url, visited=len(visited),
+                                      found=len(all_found), queued=len(to_visit), skipped=skipped,
+                                      elapsed=round(time.time() - started_at, 1))
                     new_links = _extract_sublinks(page, url, base, domain)
                     all_found.update(new_links)
+                    log_job(job_id, "extracted links", url=url, new_links=len(new_links), total_found=len(all_found))
 
                     for link in new_links:
                         if link not in visited and link not in to_visit:
                             to_visit.append(link)
+                    update_job_status(job_id, stage="queued", current_url=url, visited=len(visited),
+                                      found=len(all_found), queued=len(to_visit), skipped=skipped,
+                                      elapsed=round(time.time() - started_at, 1))
             finally:
                 browser.close()
 
@@ -396,9 +430,12 @@ def _scrape_worker(job_id: str, start_url: str, q: queue.Queue,
             }
             for l in all_found_sorted
         ]
+        elapsed = round(time.time() - started_at, 1)
+        log_job(job_id, "crawl complete", visited=len(visited), found=len(all_found_sorted), skipped=skipped, elapsed=elapsed)
         emit_terminal(q, job_id, {"type": "complete", "links": links_with_status,
-                                  "visited": len(visited), "skipped": skipped})
+                                  "visited": len(visited), "skipped": skipped, "elapsed": elapsed})
     except Exception as e:
+        log_job(job_id, "crawl fatal", reason=str(e).splitlines()[0][:180])
         emit_terminal(q, job_id, {"type": "fatal", "reason": str(e)})
 
 
@@ -895,6 +932,20 @@ def index():
 @app.route("/healthz")
 def healthz():
     return jsonify({"status": "ok"})
+
+
+@app.route("/job-status/<job_id>")
+def job_status(job_id: str):
+    job = jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+    return jsonify({
+        "job_id": job_id,
+        "type": job.get("type"),
+        "created_at": job.get("created_at"),
+        "finished_at": job.get("finished_at"),
+        "status": job.get("status", {}),
+    })
 
 
 @app.route("/scrape", methods=["POST"])
