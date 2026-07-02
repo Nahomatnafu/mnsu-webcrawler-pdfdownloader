@@ -45,6 +45,8 @@
     .btn-analyze:hover:not(:disabled) { background: #6d28d9; }
     .btn-suggest-export { background: #0e7490; color: #fff; }
     .btn-suggest-export:hover:not(:disabled) { background: #0369a1; }
+    .btn-cancel { background: #dc2626; color: #fff; }
+    .btn-cancel:hover:not(:disabled) { background: #b91c1c; }
     .actions { display: flex; gap: 10px; margin-top: 16px; flex-wrap: wrap; align-items: center; }
     .hidden { display: none !important; }
     #status-msg { font-size: 0.85rem; color: #6b7280; margin-top: 10px; min-height: 1.2em; }
@@ -119,6 +121,7 @@
       <div class="input-row">
         <input type="url" id="url-input" placeholder="https://example.edu/some/section/" />
         <button class="btn-primary" id="scrape-btn" onclick="scrapeLinks()">Find Sublinks</button>
+        <button class="btn-cancel hidden" id="cancel-scrape-btn" onclick="cancelJob('scrape')">Cancel</button>
       </div>
       <div id="status-msg"></div>
       <div style="margin-top:14px;">
@@ -146,6 +149,7 @@
       <div class="actions">
         <a id="dl-zip-btn" class="hidden"><button class="btn-dl">⬇ Download ZIP</button></a>
         <button class="btn-excel hidden" id="dl-excel-btn" onclick="exportExcel()">📊 Export Excel</button>
+        <button class="btn-cancel hidden" id="cancel-download-btn" onclick="cancelJob('download')">Cancel</button>
       </div>
     </div>
 
@@ -175,6 +179,7 @@
       </div>
       <div class="actions">
         <button class="btn-suggest-export hidden" id="suggest-export-btn" onclick="exportSuggestions()">📥 Export Suggestions Excel</button>
+        <button class="btn-cancel hidden" id="cancel-analysis-btn" onclick="cancelJob('analysis')">Cancel</button>
       </div>
     </div>
 
@@ -187,6 +192,41 @@
 
     let scrapedLinks = [];
     let suggestionResults = [];
+    const activeJobs = { scrape: null, download: null, analysis: null };
+    const activeStreams = { scrape: null, download: null, analysis: null };
+
+    function timestampSlug() {
+      const d = new Date();
+      const pad = n => String(n).padStart(2, '0');
+      return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+    }
+
+    function setCancelVisible(kind, visible) {
+      const btn = document.getElementById(`cancel-${kind}-btn`);
+      if (btn) btn.classList.toggle('hidden', !visible);
+    }
+
+    async function cancelJob(kind) {
+      const jobId = activeJobs[kind];
+      if (!jobId) return;
+      setCancelVisible(kind, false);
+      try {
+        await fetch(`${API_BASE}/cancel/${jobId}`, { method: 'POST' });
+      } catch (e) {}
+    }
+
+    function finishJob(kind) {
+      if (activeStreams[kind]) activeStreams[kind].close();
+      activeStreams[kind] = null;
+      activeJobs[kind] = null;
+      setCancelVisible(kind, false);
+    }
+
+    window.addEventListener('beforeunload', () => {
+      Object.values(activeJobs).filter(Boolean).forEach(jobId => {
+        navigator.sendBeacon(`${API_BASE}/cancel/${jobId}`);
+      });
+    });
 
     // ── Tab switching ─────────────────────────────────────────────────────────
     function switchTab(name) {
@@ -216,6 +256,8 @@
         });
         const data = await res.json();
         if (data.error) { setStatus('Error: ' + data.error); btn.disabled = false; return; }
+        activeJobs.scrape = data.job_id;
+        setCancelVisible('scrape', true);
         listenToScrapeProgress(data.job_id);
       } catch (e) {
         setStatus('Request failed: ' + e.message);
@@ -225,6 +267,7 @@
 
     function listenToScrapeProgress(jobId) {
       const es = new EventSource(`${API_BASE}/progress/${jobId}`);
+      activeStreams.scrape = es;
       es.onmessage = (e) => {
         const evt = JSON.parse(e.data);
         if (evt.type === 'using_cache') {
@@ -247,19 +290,27 @@
           setStatus(`Found ${scrapedLinks.length} page${scrapedLinks.length !== 1 ? 's' : ''} from ${evt.visited || 0} crawled${skipNote}. Switch to the Links tab →`);
           renderLinkList(newCount, doneCount);
           document.getElementById('scrape-btn').disabled = false;
-          es.close();
+          finishJob('scrape');
           switchTab('links');
+        }
+        if (evt.type === 'cancelling') {
+          setStatus('Cancelling crawl…', true);
+        }
+        if (evt.type === 'cancelled') {
+          setStatus(evt.reason || 'Crawl cancelled.');
+          document.getElementById('scrape-btn').disabled = false;
+          finishJob('scrape');
         }
         if (evt.type === 'fatal') {
           setStatus('Error: ' + evt.reason);
           document.getElementById('scrape-btn').disabled = false;
-          es.close();
+          finishJob('scrape');
         }
       };
       es.onerror = () => {
         setStatus('Connection lost.');
         document.getElementById('scrape-btn').disabled = false;
-        es.close();
+        finishJob('scrape');
       };
     }
 
@@ -310,7 +361,10 @@
         return;
       }
       const job_id = data.job_id;
+      activeJobs.download = job_id;
+      setCancelVisible('download', true);
       const es = new EventSource(`${API_BASE}/progress/${job_id}`);
+      activeStreams.download = es;
       const progList = document.getElementById('progress-list');
       const bar = document.getElementById('progress-bar');
       const items = {};
@@ -338,6 +392,14 @@
         if (evt.type === 'status') {
           document.getElementById('progress-label').textContent = evt.message;
         }
+        if (evt.type === 'cancelling') {
+          document.getElementById('progress-label').textContent = 'Cancelling PDF generation…';
+        }
+        if (evt.type === 'cancelled') {
+          document.getElementById('progress-label').textContent = evt.reason || 'PDF generation cancelled.';
+          document.getElementById('download-btn').disabled = false;
+          finishJob('download');
+        }
         if (evt.type === 'complete') {
           bar.style.width = '100%';
           document.getElementById('progress-label').textContent = 'All PDFs ready!';
@@ -345,12 +407,18 @@
           dlBtn.href = `${API_BASE}/get-zip/${job_id}`; dlBtn.classList.remove('hidden');
           document.getElementById('dl-excel-btn').classList.remove('hidden');
           document.getElementById('download-btn').disabled = false;
-          es.close();
+          finishJob('download');
         }
         if (evt.type === 'fatal') {
           document.getElementById('progress-label').textContent = 'Error: ' + evt.reason;
-          document.getElementById('download-btn').disabled = false; es.close();
+          document.getElementById('download-btn').disabled = false;
+          finishJob('download');
         }
+      };
+      es.onerror = () => {
+        document.getElementById('progress-label').textContent = 'Connection lost.';
+        document.getElementById('download-btn').disabled = false;
+        finishJob('download');
       };
     }
 
@@ -363,7 +431,7 @@
           body: JSON.stringify({ links: scrapedLinks, start_url: document.getElementById('url-input').value.trim() })
         });
         if (!res.ok) { alert('Export failed.'); return; }
-        triggerDownload(await res.blob(), 'scraped_pages.xlsx');
+        triggerDownload(await res.blob(), `scraped_pages_${timestampSlug()}.xlsx`);
       } catch (e) { alert('Export failed: ' + e.message); }
       finally { btn.disabled = false; btn.textContent = '📊 Export Excel'; }
     }
@@ -408,6 +476,8 @@
           alert('Error: ' + data.error);
           btn.disabled = false; btn.textContent = '🔍 Analyze Platforms'; return;
         }
+        activeJobs.analysis = data.job_id;
+        setCancelVisible('analysis', true);
         listenToAnalysisProgress(data.job_id);
       } catch (e) {
         alert('Failed: ' + e.message); btn.disabled = false; btn.textContent = '🔍 Analyze Platforms';
@@ -421,6 +491,7 @@
 
     function listenToAnalysisProgress(jobId) {
       const es = new EventSource(`${API_BASE}/progress/${jobId}`);
+      activeStreams.analysis = es;
       const tbody  = document.getElementById('suggest-tbody');
       const bar    = document.getElementById('suggest-bar');
       const status = document.getElementById('suggest-status');
@@ -506,6 +577,16 @@
           }
         }
 
+        if (evt.type === 'cancelling') {
+          status.textContent = 'Cancelling analysis…';
+        }
+
+        if (evt.type === 'cancelled') {
+          status.textContent = evt.reason || 'Analysis cancelled.';
+          resetAnalyzeBtn();
+          finishJob('analysis');
+        }
+
         // ── Done ──────────────────────────────────────────────────────────────
         if (evt.type === 'analysis_complete') {
           bar.style.width = '100%';
@@ -517,14 +598,19 @@
             : `✓ Done — ${evt.total} pages classified by AI`;
           document.getElementById('suggest-export-btn').classList.remove('hidden');
           resetAnalyzeBtn();
-          es.close();
+          finishJob('analysis');
         }
 
         if (evt.type === 'fatal') {
           status.textContent = 'Error: ' + evt.reason;
           resetAnalyzeBtn();
-          es.close();
+          finishJob('analysis');
         }
+      };
+      es.onerror = () => {
+        status.textContent = 'Connection lost.';
+        resetAnalyzeBtn();
+        finishJob('analysis');
       };
     }
 
@@ -537,7 +623,7 @@
           body: JSON.stringify({ results: suggestionResults, start_url: document.getElementById('url-input').value.trim() })
         });
         if (!res.ok) { alert('Export failed.'); return; }
-        triggerDownload(await res.blob(), 'platform_suggestions.xlsx');
+        triggerDownload(await res.blob(), `platform_suggestions_${timestampSlug()}.xlsx`);
       } catch (e) { alert('Export failed: ' + e.message); }
       finally { btn.disabled = false; btn.textContent = '📥 Export Suggestions Excel'; }
     }

@@ -127,6 +127,7 @@ ANALYSIS_NAV_TIMEOUT = env_int("ANALYSIS_NAV_TIMEOUT", 15000, 1000)
 CRAWL_NAV_TIMEOUT = env_int("CRAWL_NAV_TIMEOUT", 10000, 1000)
 PDF_NAV_TIMEOUT = env_int("PDF_NAV_TIMEOUT", 20000, 1000)
 PDF_SETTLE_MS = env_int("PDF_SETTLE_MS", 750, 0)
+PDF_PAGE_RECYCLE = env_int("PDF_PAGE_RECYCLE", 75, 1)
 SSE_HEARTBEAT_SECONDS = env_int("SSE_HEARTBEAT_SECONDS", 20, 5)
 MAX_ACTIVE_JOBS = env_int("MAX_ACTIVE_JOBS", 2, 1)
 JOB_RETENTION_SECONDS = env_int("JOB_RETENTION_SECONDS", 3600, 60)
@@ -185,8 +186,32 @@ def register_job(job_id: str, job: dict) -> bool:
         if active >= MAX_ACTIVE_JOBS:
             return False
         job["created_at"] = time.time()
+        job["cancelled"] = False
         jobs[job_id] = job
         return True
+
+
+def should_stop(job_id: str) -> bool:
+    with jobs_lock:
+        job = jobs.get(job_id)
+        return bool(job and job.get("cancelled"))
+
+
+def cancel_job(job_id: str) -> bool:
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if not job or job.get("finished_at"):
+            return False
+        job["cancelled"] = True
+        job.setdefault("status", {}).update(stage="cancelling", updated_at=time.time())
+        q = job.get("queue")
+    if q:
+        q.put({"type": "cancelling"})
+    return True
+
+
+def timestamp_slug() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
 def update_job_status(job_id: str, **status) -> None:
@@ -371,6 +396,10 @@ def _scrape_worker(job_id: str, start_url: str, q: queue.Queue,
         update_job_status(job_id, stage="starting", current_url=start_url, visited=0, found=0, queued=1, skipped=0)
 
         while to_visit and len(visited) < max_pages:
+            if should_stop(job_id):
+                log_job(job_id, "crawl cancelled", visited=len(visited), found=len(all_found), skipped=skipped)
+                emit_terminal(q, job_id, {"type": "cancelled", "reason": "Crawl cancelled."})
+                return
             url = to_visit.pop(0)
             if url in visited:
                 continue
@@ -444,100 +473,109 @@ def _pdf_worker(job_id: str, links: list[str], q: queue.Queue) -> None:
     try:
         with sync_playwright() as pw:
             browser = pw.chromium.launch(args=["--no-sandbox", "--disable-setuid-sandbox"])
-            context = browser.new_context(
-                user_agent="Mozilla/5.0 AppleWebKit/537.36 Chrome/120 Safari/537.36"
-            )
-            context.route("**/*", lambda route: block_resource_route(route))
-            page = context.new_page()
+            context = None
+            page = None
+            render_count = 0
 
-            for i, url in enumerate(links, 1):
-                # Skip URLs already in the manifest
-                if url in manifest:
-                    q.put({"type": "skipped", "current": i, "total": len(links), "url": url,
-                           "file": manifest[url]["file"]})
-                    continue
+            def open_page():
+                ctx = browser.new_context(
+                    user_agent="Mozilla/5.0 AppleWebKit/537.36 Chrome/120 Safari/537.36"
+                )
+                ctx.route("**/*", lambda route: block_resource_route(route))
+                return ctx, ctx.new_page()
 
-                q.put({"type": "progress", "current": i, "total": len(links), "url": url})
+            def close_page():
+                if page:
+                    page.close()
+                if context:
+                    context.close()
 
-                rel_path = url_to_filepath(url)          # e.g. pharmacy/prescriptions/refill/refill.pdf
-                out = OUTPUT_DIR / rel_path
-                out.parent.mkdir(parents=True, exist_ok=True)
+            context, page = open_page()
+            try:
+                for i, url in enumerate(links, 1):
+                    if should_stop(job_id):
+                        emit_terminal(q, job_id, {"type": "cancelled", "reason": "PDF generation cancelled."})
+                        return
+                    if url in manifest:
+                        q.put({"type": "skipped", "current": i, "total": len(links), "url": url,
+                               "file": manifest[url]["file"]})
+                        continue
 
-                try:
-                    # Use screen media so the page renders like a real browser
-                    page.emulate_media(media="screen")
-                    page.goto(url, wait_until="domcontentloaded", timeout=PDF_NAV_TIMEOUT)
-                    page.wait_for_timeout(PDF_SETTLE_MS)
+                    if render_count and render_count % PDF_PAGE_RECYCLE == 0:
+                        close_page()
+                        context, page = open_page()
+                        q.put({"type": "status", "message": f"Recycled browser after {render_count} PDFs…"})
 
-                    # Surgically remove only elements known to break multi-page PDFs.
-                    # DO NOT use * { position: static } — it collapses the entire layout.
-                    page.add_style_tag(content="""
-                        /* Hide chrome elements that don't belong in a PDF */
-                        header, nav, .nav, .navbar, .site-header,
-                        footer, .footer, .site-footer,
-                        .cookie-banner, .chat-widget, [class*="overlay"] {
-                            display: none !important;
+                    q.put({"type": "progress", "current": i, "total": len(links), "url": url})
+
+                    rel_path = url_to_filepath(url)
+                    out = OUTPUT_DIR / rel_path
+                    out.parent.mkdir(parents=True, exist_ok=True)
+
+                    try:
+                        page.emulate_media(media="screen")
+                        page.goto(url, wait_until="domcontentloaded", timeout=PDF_NAV_TIMEOUT)
+                        page.wait_for_timeout(PDF_SETTLE_MS)
+                        page.add_style_tag(content="""
+                            header, nav, .nav, .navbar, .site-header,
+                            footer, .footer, .site-footer,
+                            .cookie-banner, .chat-widget, [class*="overlay"] {
+                                display: none !important;
+                            }
+                            img, svg, video, audio, canvas,
+                            [class*="icon"], [class*="logo"], [class*="banner"],
+                            [class*="hero"], [class*="thumbnail"], [class*="carousel"],
+                            [class*="slider"], [class*="gallery"], [class*="image"],
+                            picture, figure, iframe {
+                                display: none !important;
+                            }
+                            * {
+                                background-image: none !important;
+                            }
+                            [style*="position: fixed"], [style*="position:fixed"],
+                            [style*="position: sticky"], [style*="position:sticky"] {
+                                position: static !important;
+                            }
+                            p, h1, h2, h3, h4, h5, h6, table, li, blockquote {
+                                page-break-inside: avoid;
+                                break-inside: avoid;
+                            }
+                        """)
+
+                        page.pdf(
+                            path=str(out), format="A4", print_background=True,
+                            scale=0.9,
+                            margin={"top": "1cm", "bottom": "1cm", "left": "1cm", "right": "1cm"},
+                        )
+                        pdf_paths.append(out)
+                        render_count += 1
+                        size_kb = round(out.stat().st_size / 1024, 1)
+                        manifest[url] = {
+                            "url": url,
+                            "file": str(rel_path),
+                            "scraped_at": datetime.now().isoformat(timespec="seconds"),
+                            "status": "ok",
+                            "size_kb": size_kb,
                         }
+                        save_manifest(manifest)
 
-                        /* Hide all images, icons, and decorative visuals */
-                        img, svg, video, audio, canvas,
-                        [class*="icon"], [class*="logo"], [class*="banner"],
-                        [class*="hero"], [class*="thumbnail"], [class*="carousel"],
-                        [class*="slider"], [class*="gallery"], [class*="image"],
-                        picture, figure, iframe {
-                            display: none !important;
-                        }
+                        q.put({"type": "done_one", "url": url,
+                               "file": str(rel_path), "size_kb": size_kb})
+                    except Exception as e:
+                        q.put({"type": "error_one", "url": url, "reason": str(e)})
 
-                        /* Strip background images but keep background colors for structure */
-                        * {
-                            background-image: none !important;
-                        }
+                    if i < len(links):
+                        time.sleep(0.4)
+            finally:
+                close_page()
+                browser.close()
 
-                        /* Unpin only fixed/sticky elements so they don't
-                           repeat or cover content on pages 2+ */
-                        [style*="position: fixed"], [style*="position:fixed"],
-                        [style*="position: sticky"], [style*="position:sticky"] {
-                            position: static !important;
-                        }
+        if should_stop(job_id):
+            emit_terminal(q, job_id, {"type": "cancelled", "reason": "PDF generation cancelled."})
+            return
 
-                        /* Prevent content being clipped mid-element at page breaks */
-                        p, h1, h2, h3, h4, h5, h6, table, li, blockquote {
-                            page-break-inside: avoid;
-                            break-inside: avoid;
-                        }
-                    """)
-
-                    page.pdf(
-                        path=str(out), format="A4", print_background=True,
-                        scale=0.9,
-                        margin={"top": "1cm", "bottom": "1cm", "left": "1cm", "right": "1cm"},
-                    )
-                    pdf_paths.append(out)
-                    size_kb = round(out.stat().st_size / 1024, 1)
-
-                    # Update manifest immediately after each successful save
-                    manifest[url] = {
-                        "url": url,
-                        "file": str(rel_path),
-                        "scraped_at": datetime.now().isoformat(timespec="seconds"),
-                        "status": "ok",
-                        "size_kb": size_kb,
-                    }
-                    save_manifest(manifest)
-
-                    q.put({"type": "done_one", "url": url,
-                           "file": str(rel_path), "size_kb": size_kb})
-                except Exception as e:
-                    q.put({"type": "error_one", "url": url, "reason": str(e)})
-
-                if i < len(links):
-                    time.sleep(0.4)
-
-            browser.close()
-
-        # Zip preserving the folder structure
         q.put({"type": "status", "message": "Creating ZIP file..."})
-        zip_path = OUTPUT_DIR / f"pages-{job_id}.zip"
+        zip_path = OUTPUT_DIR / f"pages-{job_id}-{timestamp_slug()}.zip"
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             for i, p in enumerate(pdf_paths, 1):
                 zf.write(p, p.relative_to(OUTPUT_DIR))
@@ -699,7 +737,7 @@ async def _call_claude(client, page_name: str, url: str, excerpt: str) -> dict |
     return None
 
 
-async def _run_ai_analysis(results: list[dict], by_index: dict[int, dict], q: queue.Queue) -> None:
+async def _run_ai_analysis(job_id: str, results: list[dict], by_index: dict[int, dict], q: queue.Queue) -> None:
     """
     Fetch + classify every page, streaming upgrades as each finishes.
 
@@ -731,6 +769,8 @@ async def _run_ai_analysis(results: list[dict], by_index: dict[int, dict], q: qu
     # ── 1. Serve cached results instantly (no browser involved) ───────────────
     uncached: list[dict] = []
     for r in results:
+        if should_stop(job_id):
+            return
         cached = _load_suggest_cache(r["url"])
         if cached:
             done += 1
@@ -747,9 +787,10 @@ async def _run_ai_analysis(results: list[dict], by_index: dict[int, dict], q: qu
 
     async with async_playwright() as pw:
         for start in range(0, len(uncached), batch_size):
+            if should_stop(job_id):
+                return
             batch = uncached[start:start + batch_size]
 
-            # Fresh browser per batch → peak memory resets every batch.
             browser = await pw.chromium.launch(
                 args=["--no-sandbox", "--disable-setuid-sandbox"])
             context = await browser.new_context(
@@ -759,7 +800,11 @@ async def _run_ai_analysis(results: list[dict], by_index: dict[int, dict], q: qu
 
             async def analyze_one(result: dict) -> dict:
                 idx, url = result["index"], result["url"]
+                if should_stop(job_id):
+                    return {"index": idx, "error": "cancelled"}
                 async with sem:
+                    if should_stop(job_id):
+                        return {"index": idx, "error": "cancelled"}
                     page = await context.new_page()
                     try:
                         await page.goto(url, wait_until="domcontentloaded",
@@ -784,7 +829,14 @@ async def _run_ai_analysis(results: list[dict], by_index: dict[int, dict], q: qu
             try:
                 tasks = [asyncio.create_task(analyze_one(r)) for r in batch]
                 for fut in asyncio.as_completed(tasks):
+                    if should_stop(job_id):
+                        for task in tasks:
+                            task.cancel()
+                        await asyncio.gather(*tasks, return_exceptions=True)
+                        return
                     res = await fut
+                    if res.get("error") == "cancelled":
+                        return
                     done += 1
                     _emit(res)
             finally:
@@ -805,6 +857,9 @@ def _analysis_worker(job_id: str, links: list[dict], q: queue.Queue) -> None:
     try:
         # ── Instant placeholder rows ──────────────────────────────────────────
         for i, link in enumerate(links, 1):
+            if should_stop(job_id):
+                emit_terminal(q, job_id, {"type": "cancelled", "reason": "Analysis cancelled."})
+                return
             url = link.get("url", "")
             segments = [s for s in urlparse(url).path.strip("/").split("/") if s]
             page_name = segments[-1].replace("-", " ").title() if segments else "Home"
@@ -829,7 +884,11 @@ def _analysis_worker(job_id: str, links: list[dict], q: queue.Queue) -> None:
 
         # ── AI analysis (async, concurrent) ───────────────────────────────────
         q.put({"type": "analysis_started", "total": total})
-        asyncio.run(_run_ai_analysis(results, by_index, q))
+        asyncio.run(_run_ai_analysis(job_id, results, by_index, q))
+
+        if should_stop(job_id):
+            emit_terminal(q, job_id, {"type": "cancelled", "reason": "Analysis cancelled."})
+            return
 
         jobs[job_id]["analysis_results"] = results
         emit_terminal(q, job_id, {"type": "analysis_complete", "total": total})
@@ -941,8 +1000,16 @@ def job_status(job_id: str):
         "type": job.get("type"),
         "created_at": job.get("created_at"),
         "finished_at": job.get("finished_at"),
+        "cancelled": job.get("cancelled", False),
         "status": job.get("status", {}),
     })
+
+
+@app.route("/cancel/<job_id>", methods=["POST"])
+def cancel(job_id: str):
+    if not cancel_job(job_id):
+        return jsonify({"error": "Job not found or already finished"}), 404
+    return jsonify({"status": "cancelling"})
 
 
 @app.route("/scrape", methods=["POST"])
@@ -989,7 +1056,7 @@ def progress(job_id: str):
                 if evt.get("type") == "complete" and job.get("type") == "scrape":
                     job["links"] = evt.get("links", [])
                 yield f"data: {json.dumps(evt)}\n\n"
-                if evt.get("type") in ("complete", "fatal"):
+                if evt.get("type") in ("complete", "fatal", "cancelled"):
                     job["finished_at"] = time.time()
                     break
             except queue.Empty:
@@ -1004,7 +1071,7 @@ def get_zip(job_id: str):
     job = jobs.get(job_id)
     if not job or not job.get("zip_path"):
         return "Not ready", 404
-    return send_file(job["zip_path"], as_attachment=True, download_name="pages.zip")
+    return send_file(job["zip_path"], as_attachment=True, download_name=f"pages_{timestamp_slug()}.zip")
 
 
 @app.route("/export-excel", methods=["POST"])
@@ -1026,7 +1093,7 @@ def export_excel_route():
                 link["scraped_at"] = manifest[url]["scraped_at"]
                 link["size_kb"]    = manifest[url].get("size_kb", "")
         path = export_excel(links, start_url)
-        return send_file(str(path), as_attachment=True, download_name="scraped_pages.xlsx")
+        return send_file(str(path), as_attachment=True, download_name=f"scraped_pages_{timestamp_slug()}.xlsx")
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -1056,7 +1123,7 @@ def export_suggestions_route():
         return jsonify({"error": "No results provided"}), 400
     try:
         path = export_suggestions(results, start_url)
-        return send_file(str(path), as_attachment=True, download_name="platform_suggestions.xlsx")
+        return send_file(str(path), as_attachment=True, download_name=f"platform_suggestions_{timestamp_slug()}.xlsx")
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
