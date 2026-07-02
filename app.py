@@ -506,6 +506,8 @@ def _pdf_worker(job_id: str, links: list[str], q: queue.Queue) -> None:
                         context, page = open_page()
                         q.put({"type": "status", "message": f"Recycled browser after {render_count} PDFs…"})
 
+                    update_job_status(job_id, stage="pdf_rendering", current=i, total=len(links), current_url=url,
+                                      rendered=render_count, errors=jobs[job_id].get("status", {}).get("errors", 0))
                     q.put({"type": "progress", "current": i, "total": len(links), "url": url})
 
                     rel_path = url_to_filepath(url)
@@ -559,9 +561,15 @@ def _pdf_worker(job_id: str, links: list[str], q: queue.Queue) -> None:
                         }
                         save_manifest(manifest)
 
+                        update_job_status(job_id, stage="pdf_done", current=i, total=len(links), current_url=url,
+                                          rendered=render_count, last_file=str(rel_path))
                         q.put({"type": "done_one", "url": url,
                                "file": str(rel_path), "size_kb": size_kb})
                     except Exception as e:
+                        current_status = jobs[job_id].get("status", {})
+                        error_count = current_status.get("errors", 0) + 1
+                        update_job_status(job_id, stage="pdf_error", current=i, total=len(links), current_url=url,
+                                          rendered=render_count, errors=error_count, last_error=str(e)[:200])
                         q.put({"type": "error_one", "url": url, "reason": str(e)})
 
                     if i < len(links):
@@ -574,6 +582,7 @@ def _pdf_worker(job_id: str, links: list[str], q: queue.Queue) -> None:
             emit_terminal(q, job_id, {"type": "cancelled", "reason": "PDF generation cancelled."})
             return
 
+        update_job_status(job_id, stage="zipping", rendered=render_count, total=len(links))
         q.put({"type": "status", "message": "Creating ZIP file..."})
         zip_path = OUTPUT_DIR / f"pages-{job_id}-{timestamp_slug()}.zip"
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:

@@ -308,9 +308,9 @@
         }
       };
       es.onerror = () => {
-        setStatus('Connection lost.');
-        document.getElementById('scrape-btn').disabled = false;
-        finishJob('scrape');
+        if (activeJobs.scrape === jobId) {
+          setStatus('Connection interrupted; reconnecting…', true);
+        }
       };
     }
 
@@ -416,9 +416,9 @@
         }
       };
       es.onerror = () => {
-        document.getElementById('progress-label').textContent = 'Connection lost.';
-        document.getElementById('download-btn').disabled = false;
-        finishJob('download');
+        if (activeJobs.download === job_id) {
+          document.getElementById('progress-label').textContent = 'Connection interrupted; reconnecting…';
+        }
       };
     }
 
@@ -608,9 +608,9 @@
         }
       };
       es.onerror = () => {
-        status.textContent = 'Connection lost.';
-        resetAnalyzeBtn();
-        finishJob('analysis');
+        if (activeJobs.analysis === jobId) {
+          status.textContent = 'Connection interrupted; reconnecting…';
+        }
       };
     }
 
