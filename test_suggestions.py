@@ -61,6 +61,31 @@ class TestClampPlatform(unittest.TestCase):
         self.assertEqual(clamp_platform(normalize_platform("garbage value")), "No Clear Fit")
 
 
+class TestAiFallbacks(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import app
+        cls.app = app
+
+    def test_parse_ai_json_accepts_wrapped_json(self):
+        raw = 'Here is the result:\n```json\n{"platform":"Website","confidence":"Low","reason":"Public info"}\n```'
+        parsed = self.app.parse_ai_json(raw)
+        self.assertEqual(parsed["platform"], "Website")
+
+    def test_tobacco_policy_fallback_goes_to_onestop(self):
+        result = self.app.fallback_platform_suggestion(
+            "Report Smoking On Campus",
+            "https://mankato.mnsu.edu/university-life/health-and-safety/campus-wellness/tobacco-free-campus/report-smoking-on-campus/",
+            "Report a tobacco policy violation or smoking on campus.",
+        )
+        self.assertEqual(result["platform"], "Maverick OneStop")
+        self.assertEqual(result["confidence"], "Medium")
+
+    def test_credit_error_detection(self):
+        self.assertTrue(self.app.is_credit_error(Exception("credit balance is too low")))
+        self.assertFalse(self.app.is_credit_error(Exception("temporary network error")))
+
+
 class TestUrlToFilepath(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

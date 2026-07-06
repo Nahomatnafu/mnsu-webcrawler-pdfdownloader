@@ -6,12 +6,12 @@
   <title>Page → PDF</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: system-ui, sans-serif; background: #f4f5f7; color: #1a1a2e; min-height: 100vh; display: flex; flex-direction: column; align-items: center; padding: 40px 16px; }
-    h1 { font-size: 1.55rem; font-weight: 700; margin-bottom: 5px; }
-    .subtitle { color: #6b7280; font-size: 0.88rem; margin-bottom: 28px; }
+    body { font-family: system-ui, sans-serif; background: #f4f5f7; color: #1a1a2e; min-height: 100vh; display: flex; flex-direction: column; align-items: center; padding: 48px 24px; }
+    h1 { font-size: 1.65rem; font-weight: 700; margin-bottom: 6px; }
+    .subtitle { color: #6b7280; font-size: 0.92rem; margin-bottom: 30px; }
 
     /* ── App shell ── */
-    .app { width: 100%; max-width: 920px; background: #fff; border-radius: 14px; box-shadow: 0 2px 20px rgba(0,0,0,.09); overflow: hidden; }
+    .app { width: min(100%, 1220px); background: #fff; border-radius: 16px; box-shadow: 0 2px 24px rgba(0,0,0,.09); overflow: hidden; }
 
     /* ── Tab bar ── */
     .tab-bar { display: flex; background: #f8f9fb; border-bottom: 2px solid #e5e7eb; }
@@ -23,7 +23,7 @@
     .tab.active .tab-badge { background: #4f46e5; color: #fff; }
 
     /* ── Panels ── */
-    .panel { display: none; padding: 28px; min-height: 320px; }
+    .panel { display: none; padding: 34px; min-height: 450px; }
     .panel.active { display: block; }
 
     /* ── Common elements ── */
@@ -54,7 +54,7 @@
     @keyframes spin { to { transform: rotate(360deg); } }
 
     /* ── Link list ── */
-    .link-list { list-style: none; max-height: 340px; overflow-y: auto; border: 1.5px solid #e5e7eb; border-radius: 8px; }
+    .link-list { list-style: none; max-height: 520px; overflow-y: auto; border: 1.5px solid #e5e7eb; border-radius: 8px; }
     .link-list li { padding: 8px 14px; font-size: 0.83rem; border-bottom: 1px solid #f3f4f6; color: #374151; word-break: break-all; }
     .link-list li:last-child { border-bottom: none; }
     .link-list li.done::before   { content: "✓  "; color: #16a34a; }
@@ -73,7 +73,7 @@
     .progress-bar { height: 100%; background: #4f46e5; border-radius: 99px; width: 0%; transition: width .3s; }
 
     /* ── Suggestion table ── */
-    .suggest-wrap { max-height: 440px; overflow-y: auto; border: 1.5px solid #e5e7eb; border-radius: 8px; }
+    .suggest-wrap { max-height: 600px; overflow-y: auto; border: 1.5px solid #e5e7eb; border-radius: 8px; }
     .suggest-table { width: 100%; border-collapse: collapse; font-size: 0.81rem; }
     .suggest-table th { background: #4f46e5; color: #fff; padding: 8px 10px; text-align: left; font-weight: 600; position: sticky; top: 0; z-index: 1; }
     .suggest-table td { padding: 7px 10px; border-bottom: 1px solid #f3f4f6; vertical-align: top; word-break: break-word; }
@@ -450,11 +450,12 @@
     async function analyzeLinks() {
       if (!scrapedLinks.length) { alert('Scrape some links first.'); return; }
       const n = scrapedLinks.length;
-      const estCost = (n * 0.0015).toFixed(2);
+      const estimatedLow = (n * 0.0025).toFixed(2);
+      const estimatedHigh = (n * 0.0035).toFixed(2);
       if (!confirm(
         `Analyze ${n} page${n !== 1 ? 's' : ''} with AI?\n\n` +
         `Each page's content is read and classified by Claude using the Content Management Guide.\n` +
-        `Estimated cost: ~$${estCost} (about $0.0015 per page).`
+        `Conservative estimate: ~$${estimatedLow}–$${estimatedHigh} total. Actual cost can vary by page length and cache hits.`
       )) return;
 
       const btn = document.getElementById('analyze-btn');

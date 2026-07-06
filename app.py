@@ -103,6 +103,18 @@ TIER2_SYSTEM_BLOCKS = [
 # Default 3 keeps a typical laptop responsive; raise on a beefy machine, lower
 # (e.g. 2) on memory-constrained hosts like the Render free tier (512 MB RAM).
 TIER2_MODEL = "claude-haiku-4-5"
+AI_CREDIT_ERROR_MARKERS = (
+    "credit balance",
+    "insufficient credit",
+    "insufficient_quota",
+    "billing",
+    "payment required",
+    "quota exceeded",
+)
+
+
+class AIQuotaError(Exception):
+    pass
 
 
 def env_int(name: str, default: int, minimum: int | None = None) -> int:
@@ -726,6 +738,43 @@ def _save_suggest_cache(url: str, data: dict) -> None:
         pass
 
 
+def is_credit_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(marker in text for marker in AI_CREDIT_ERROR_MARKERS)
+
+
+def parse_ai_json(raw: str) -> dict:
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```[a-z]*\n?", "", raw)
+        raw = re.sub(r"\n?```$", "", raw.strip())
+    match = re.search(r"\{.*\}", raw, flags=re.S)
+    if not match:
+        raise ValueError("No JSON object found")
+    return json.loads(match.group(0))
+
+
+def fallback_platform_suggestion(page_name: str, url: str, excerpt: str) -> dict:
+    text = f"{page_name} {url} {excerpt}".lower()
+    if any(word in text for word in ("policy", "policies", "procedure", "form", "report", "complaint", "tobacco", "smoking", "violation")):
+        return {
+            "platform": "Maverick OneStop",
+            "confidence": "Medium",
+            "reason": "Fallback rule: policy, reporting, form, or procedure content usually belongs in Maverick OneStop.",
+        }
+    if any(word in text for word in ("student organization", "club", "homecoming", "activities", "mavlife")):
+        return {
+            "platform": "MavLife / Student Hub",
+            "confidence": "Low",
+            "reason": "Fallback rule: student activity content may belong in MavLife / Student Hub.",
+        }
+    return {
+        "platform": "Website",
+        "confidence": "Low",
+        "reason": "Fallback rule used because AI returned no valid classification; public-facing informational content defaults to Website.",
+    }
+
+
 async def _call_claude(client, page_name: str, url: str, excerpt: str) -> dict | None:
     """Classify one page with Claude. Retries transient API failures with backoff."""
     user_msg = (
@@ -735,6 +784,7 @@ async def _call_claude(client, page_name: str, url: str, excerpt: str) -> dict |
         "Classify this page into the single best MNSU platform per the guide. "
         "If the content is ambiguous or too thin to tell, use Low confidence."
     )
+    last_error = "AI classification failed"
     for attempt in range(3):
         try:
             resp = await client.messages.create(
@@ -743,24 +793,27 @@ async def _call_claude(client, page_name: str, url: str, excerpt: str) -> dict |
                 system=TIER2_SYSTEM_BLOCKS,
                 messages=[{"role": "user", "content": user_msg}],
             )
-        except Exception:
-            await asyncio.sleep(1.5 * (attempt + 1))   # backoff on rate-limit/overload
+        except Exception as e:
+            if is_credit_error(e):
+                raise AIQuotaError("Anthropic API credits appear to be exhausted or billing is unavailable. Add credits, then restart the analysis.") from e
+            last_error = str(e)
+            await asyncio.sleep(1.5 * (attempt + 1))
             continue
         try:
             raw = resp.content[0].text.strip()
-            if raw.startswith("```"):
-                raw = re.sub(r"^```[a-z]*\n?", "", raw)
-                raw = re.sub(r"\n?```$", "", raw.strip())
-            ai = json.loads(raw.strip())
+            ai = parse_ai_json(raw)
             platform = clamp_platform(normalize_platform(ai.get("platform", "")))
             confidence = ai.get("confidence", "Low")
             if confidence not in ("High", "Medium", "Low"):
                 confidence = "Low"
             reason = (ai.get("reason") or "").strip() or "No reason provided."
             return {"platform": platform, "confidence": confidence, "reason": reason}
-        except Exception:
-            return None   # malformed JSON won't be fixed by retrying
-    return None
+        except Exception as e:
+            last_error = str(e)
+            await asyncio.sleep(0.5 * (attempt + 1))
+    fallback = fallback_platform_suggestion(page_name, url, excerpt)
+    fallback["reason"] = f"{fallback['reason']} AI fallback reason: {last_error[:120]}."
+    return fallback
 
 
 async def _run_ai_analysis(job_id: str, results: list[dict], by_index: dict[int, dict], q: queue.Queue) -> None:
@@ -847,7 +900,7 @@ async def _run_ai_analysis(job_id: str, results: list[dict], by_index: dict[int,
                     ai = await _call_claude(client, page_name, url, excerpt)
 
                 if ai is None:
-                    return {"index": idx, "error": "AI classification failed"}
+                    ai = fallback_platform_suggestion(page_name, url, excerpt)
                 out = {"page_name": page_name, **ai}
                 _save_suggest_cache(url, out)
                 return {"index": idx, **out}
@@ -860,7 +913,13 @@ async def _run_ai_analysis(job_id: str, results: list[dict], by_index: dict[int,
                             task.cancel()
                         await asyncio.gather(*tasks, return_exceptions=True)
                         return
-                    res = await fut
+                    try:
+                        res = await fut
+                    except AIQuotaError:
+                        for task in tasks:
+                            task.cancel()
+                        await asyncio.gather(*tasks, return_exceptions=True)
+                        raise
                     if res.get("error") == "cancelled":
                         return
                     done += 1
@@ -918,6 +977,8 @@ def _analysis_worker(job_id: str, links: list[dict], q: queue.Queue) -> None:
 
         jobs[job_id]["analysis_results"] = results
         emit_terminal(q, job_id, {"type": "analysis_complete", "total": total})
+    except AIQuotaError as e:
+        emit_terminal(q, job_id, {"type": "fatal", "reason": str(e)})
     except Exception as e:
         emit_terminal(q, job_id, {"type": "fatal", "reason": str(e)})
 
@@ -1014,6 +1075,11 @@ def index():
 @app.route("/healthz")
 def healthz():
     return jsonify({"status": "ok"})
+
+
+@app.route("/favicon.ico")
+def favicon():
+    return Response(status=204)
 
 
 @app.route("/job-status/<job_id>")
