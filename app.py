@@ -139,6 +139,8 @@ SUGGEST_CACHE_DIR = DATA_DIR / "suggestion_cache"
 # stops on its own once it exhausts the in-scope queue; this only caps runaway
 # crawls.  Default is well above large sections so full coverage isn't truncated.
 CRAWL_MAX_PAGES = env_int("CRAWL_MAX_PAGES", 1000, 1)
+SAFE_PATH_SEGMENT_MAX = env_int("SAFE_PATH_SEGMENT_MAX", 48, 16)
+SAFE_REL_PATH_MAX = env_int("SAFE_REL_PATH_MAX", 150, 80)
 
 app = Flask(__name__)
 
@@ -268,22 +270,37 @@ async def block_resource_route_async(route, include_stylesheets: bool = False) -
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
+def safe_path_segment(value: str, fallback: str = "page") -> str:
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip(".-_")
+    slug = re.sub(r"-+", "-", slug) or fallback
+    return slug[:SAFE_PATH_SEGMENT_MAX].strip(".-_") or fallback
+
+
+def path_text_length(path: Path) -> int:
+    return len(str(path).replace("\\", "/"))
+
+
 def url_to_filepath(url: str) -> Path:
-    """
-    Map a URL to a relative file path mirroring the URL structure.
-    e.g. /pharmacy/prescriptions/refill/ -> pharmacy/prescriptions/refill/refill.pdf
-    The last path segment becomes both the folder name and the filename.
-    Index pages (ending in /) are named after their own folder segment.
-    """
     parsed = urlparse(url)
-    # Strip leading slash, split into segments, drop empty strings
-    segments = [s for s in parsed.path.strip("/").split("/") if s]
+    url_hash = hashlib.sha1(url.encode("utf-8")).hexdigest()[:10]
+    segments = [safe_path_segment(s) for s in parsed.path.strip("/").split("/") if s]
     if not segments:
-        return Path("index.pdf")
-    # All segments form the folder path; last segment is also the filename
-    folder = Path(*segments)
-    filename = segments[-1] + ".pdf"
-    return folder / filename
+        return Path(f"index-{url_hash}.pdf")
+
+    filename_base = safe_path_segment(segments[-1], "page")
+    filename = f"{filename_base}-{url_hash}.pdf"
+    dirs = segments[:-1]
+    rel_path = Path(*dirs, filename) if dirs else Path(filename)
+
+    while dirs and path_text_length(rel_path) > SAFE_REL_PATH_MAX:
+        dirs.pop(0)
+        rel_path = Path(*dirs, filename) if dirs else Path(filename)
+
+    if path_text_length(rel_path) > SAFE_REL_PATH_MAX:
+        filename_base = filename_base[:max(16, SAFE_REL_PATH_MAX - len(url_hash) - 6)].strip(".-_") or "page"
+        rel_path = Path(f"{filename_base}-{url_hash}.pdf")
+
+    return rel_path
 
 
 def load_manifest() -> dict:

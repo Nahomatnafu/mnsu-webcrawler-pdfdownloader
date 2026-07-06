@@ -61,6 +61,29 @@ class TestClampPlatform(unittest.TestCase):
         self.assertEqual(clamp_platform(normalize_platform("garbage value")), "No Clear Fit")
 
 
+class TestUrlToFilepath(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import app
+        cls.app = app
+
+    def test_long_mnsu_url_stays_under_safe_limit(self):
+        url = "https://mankato.mnsu.edu/university-life/activities-and-organizations/Homecoming/student-competitions/schedule-of-events/homecoming-kick-off---live-music-games-in-the-mall-themed-raffle-bag-giveaway/"
+        path = self.app.url_to_filepath(url)
+        self.assertLessEqual(self.app.path_text_length(path), self.app.SAFE_REL_PATH_MAX)
+        self.assertEqual(path.suffix, ".pdf")
+
+    def test_different_long_urls_do_not_collide_after_truncation(self):
+        base = "https://mankato.mnsu.edu/university-life/activities-and-organizations/Homecoming/student-competitions/schedule-of-events/"
+        first = self.app.url_to_filepath(base + "homecoming-kick-off---live-music-games-in-the-mall-themed-raffle-bag-giveaway/")
+        second = self.app.url_to_filepath(base + "homecoming-kick-off---live-music-games-in-the-mall-themed-raffle-bag-giveaway-extra/")
+        self.assertNotEqual(first, second)
+
+    def test_root_url_uses_hashed_index_pdf(self):
+        path = self.app.url_to_filepath("https://mankato.mnsu.edu/")
+        self.assertRegex(path.name, r"^index-[0-9a-f]{10}\.pdf$")
+
+
 class TestGuideLoader(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
