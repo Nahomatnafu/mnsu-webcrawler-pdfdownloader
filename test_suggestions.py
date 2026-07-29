@@ -86,6 +86,83 @@ class TestAiFallbacks(unittest.TestCase):
         self.assertFalse(self.app.is_credit_error(Exception("temporary network error")))
 
 
+class TestProgressReconnect(unittest.TestCase):
+    """A dropped SSE stream must not leave the UI stuck on "reconnecting"."""
+
+    @classmethod
+    def setUpClass(cls):
+        import app
+        cls.app = app
+
+    def setUp(self):
+        import queue
+        self.queue = queue
+        self.client = self.app.app.test_client()
+        self._original_heartbeat = self.app.SSE_HEARTBEAT_SECONDS
+        self.app.SSE_HEARTBEAT_SECONDS = 5
+
+    def tearDown(self):
+        self.app.SSE_HEARTBEAT_SECONDS = self._original_heartbeat
+
+    def _first_event(self, job_id):
+        import json
+        response = self.client.get(f"/progress/{job_id}")
+        buffered = ""
+        for chunk in response.response:
+            buffered += chunk.decode("utf-8", "ignore")
+            if "\n\n" in buffered:
+                raw = buffered.split("\n\n", 1)[0].strip()
+                if raw.startswith("data: "):
+                    return json.loads(raw[6:])
+        return None
+
+    def _finished_job(self, job_id, job, terminal):
+        q = self.queue.Queue()
+        job["queue"] = q
+        self.assertTrue(self.app.register_job(job_id, job))
+        self.app.emit_terminal(q, job_id, terminal)
+        while not q.empty():      # the dropped connection consumed the event
+            q.get()
+        return q
+
+    def test_reconnect_replays_completion_instead_of_heartbeats(self):
+        job_id = "test-reconnect-download"
+        self._finished_job(job_id, {"type": "download", "zip_path": "x.zip"}, {"type": "complete"})
+        event = self._first_event(job_id)
+        self.assertIsNotNone(event)
+        self.assertEqual(event["type"], "complete")
+
+    def test_reconnect_replays_cancellation(self):
+        job_id = "test-reconnect-cancelled"
+        self._finished_job(job_id, {"type": "download", "zip_path": None},
+                           {"type": "cancelled", "reason": "Download cancelled."})
+        self.assertEqual(self._first_event(job_id)["type"], "cancelled")
+
+    def test_reconnect_replay_is_repeatable(self):
+        job_id = "test-reconnect-twice"
+        self._finished_job(job_id, {"type": "download", "zip_path": "x.zip"}, {"type": "complete"})
+        self.assertEqual(self._first_event(job_id)["type"], "complete")
+        self.assertEqual(self._first_event(job_id)["type"], "complete")
+
+    def test_reconnect_restores_scrape_links(self):
+        job_id = "test-reconnect-scrape"
+        links = [{"url": "https://example.edu/a/", "done": False}]
+        self._finished_job(job_id, {"type": "scrape", "links": None, "zip_path": None},
+                           {"type": "complete", "links": links, "visited": 1, "skipped": 0})
+        event = self._first_event(job_id)
+        self.assertEqual(event["type"], "complete")
+        self.assertEqual(event["links"], links)
+        self.assertEqual(self.app.jobs[job_id]["links"], links)
+
+    def test_job_status_reports_zip_readiness(self):
+        ready_id, pending_id = "test-zip-ready", "test-zip-pending"
+        self._finished_job(ready_id, {"type": "download", "zip_path": "done.zip"}, {"type": "complete"})
+        self._finished_job(pending_id, {"type": "download", "zip_path": None},
+                           {"type": "cancelled", "reason": "Download cancelled."})
+        self.assertTrue(self.client.get(f"/job-status/{ready_id}").get_json()["zip_ready"])
+        self.assertFalse(self.client.get(f"/job-status/{pending_id}").get_json()["zip_ready"])
+
+
 class TestDocxHyperlinks(unittest.TestCase):
     NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 

@@ -415,10 +415,36 @@
           finishJob('download');
         }
       };
-      es.onerror = () => {
-        if (activeJobs.download === job_id) {
-          document.getElementById('progress-label').textContent = 'Connection interrupted; reconnecting…';
-        }
+      es.onerror = async () => {
+        if (activeJobs.download !== job_id) return;
+        const label = document.getElementById('progress-label');
+        label.textContent = 'Connection interrupted; reconnecting…';
+        try {
+          const res = await fetch(`${API_BASE}/job-status/${job_id}`);
+          if (activeJobs.download !== job_id) return;
+          if (res.status === 404) {
+            label.textContent = 'This download session expired. Start a new download to get a fresh ZIP.';
+            document.getElementById('download-btn').disabled = false;
+            finishJob('download');
+            return;
+          }
+          const st = await res.json();
+          if (activeJobs.download !== job_id || !st.finished_at) return;
+          if (st.zip_ready) {
+            bar.style.width = '100%';
+            label.textContent = 'All files ready!';
+            const dlBtn = document.getElementById('dl-zip-btn');
+            dlBtn.href = `${API_BASE}/get-zip/${job_id}`;
+            dlBtn.classList.remove('hidden');
+            document.getElementById('dl-excel-btn').classList.remove('hidden');
+          } else if (st.cancelled) {
+            label.textContent = 'Download cancelled.';
+          } else {
+            label.textContent = 'Download stopped before the ZIP was created. Please try again.';
+          }
+          document.getElementById('download-btn').disabled = false;
+          finishJob('download');
+        } catch (e) {}
       };
     }
 

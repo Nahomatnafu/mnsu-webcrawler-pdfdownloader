@@ -255,6 +255,10 @@ def finish_job(job_id: str) -> None:
 
 def emit_terminal(q: queue.Queue, job_id: str, event: dict) -> None:
     update_job_status(job_id, stage=event.get("type"), terminal=True)
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if job is not None:
+            job["terminal"] = event
     finish_job(job_id)
     q.put(event)
 
@@ -1206,6 +1210,7 @@ def job_status(job_id: str):
         "created_at": job.get("created_at"),
         "finished_at": job.get("finished_at"),
         "cancelled": job.get("cancelled", False),
+        "zip_ready": bool(job.get("zip_path")),
         "status": job.get("status", {}),
     })
 
@@ -1255,6 +1260,12 @@ def progress(job_id: str):
 
     def stream():
         q = job["queue"]
+        replay = job.get("terminal")
+        if replay:
+            if replay.get("type") == "complete" and job.get("type") == "scrape":
+                job["links"] = replay.get("links", [])
+            yield f"data: {json.dumps(replay)}\n\n"
+            return
         while True:
             try:
                 evt = q.get(timeout=SSE_HEARTBEAT_SECONDS)
