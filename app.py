@@ -14,6 +14,9 @@ from urllib.request import Request, urlopen
 import anthropic
 import docx
 from docx.shared import Pt, Inches
+from docx.oxml.ns import qn
+from docx.oxml import OxmlElement
+import docx.opc.constants
 import openpyxl
 from dotenv import load_dotenv
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -496,7 +499,69 @@ def _scrape_worker(job_id: str, start_url: str, q: queue.Queue,
         emit_terminal(q, job_id, {"type": "fatal", "reason": str(e)})
 
 
+
+def _add_hyperlink(paragraph, text, url):
+    part = paragraph.part
+    r_id = part.relate_to(url, docx.opc.constants.RELATIONSHIP_TYPE.HYPERLINK, is_external=True)
+    hyperlink = OxmlElement("w:hyperlink")
+    hyperlink.set(qn("r:id"), r_id)
+    new_run = OxmlElement("w:r")
+    rPr = OxmlElement("w:rPr")
+    rStyle = OxmlElement("w:rStyle")
+    rStyle.set(qn("w:val"), "Hyperlink")
+    rPr.append(rStyle)
+    c = OxmlElement("w:color")
+    c.set(qn("w:val"), "0563C1")
+    rPr.append(c)
+    u = OxmlElement("w:u")
+    u.set(qn("w:val"), "single")
+    rPr.append(u)
+    new_run.append(rPr)
+    new_run.text = text
+    hyperlink.append(new_run)
+    paragraph._p.append(hyperlink)
+
+
+def _build_docx_from_content(title, structured, out_path):
+    doc = docx.Document()
+    section = doc.sections[0]
+    section.top_margin = Inches(1); section.bottom_margin = Inches(1)
+    section.left_margin = Inches(1); section.right_margin = Inches(1)
+    heading = doc.add_heading(title, level=1)
+    heading.runs[0].font.size = Pt(16)
+    for item in structured:
+        if not isinstance(item, dict):
+            continue
+        t = (item.get("text") or "").strip()
+        link = item.get("href", "")
+        tag = (item.get("tag") or "").lower()
+        if not t:
+            continue
+        if tag in ("h2",):
+            h = doc.add_heading(t, level=2)
+            for run in h.runs:
+                run.font.size = Pt(13)
+        elif tag in ("h3",):
+            h = doc.add_heading(t, level=3)
+            for run in h.runs:
+                run.font.size = Pt(12)
+        elif tag == "li":
+            p = doc.add_paragraph(t, style="List Bullet")
+            if link:
+                p.clear()
+                _add_hyperlink(p, t, link)
+        else:
+            p = doc.add_paragraph()
+            if link:
+                _add_hyperlink(p, t, link)
+            else:
+                run = p.add_run(t)
+                run.font.size = Pt(11)
+    doc.save(str(out_path))
+
+
 def _download_worker(job_id: str, links: list[str], q: queue.Queue) -> None:
+
     manifest = load_manifest()
     pdf_paths = []
     docx_paths = []
@@ -563,6 +628,22 @@ def _download_worker(job_id: str, links: list[str], q: queue.Queue) -> None:
                                  margin={"top": "1cm", "bottom": "1cm", "left": "1cm", "right": "1cm"})
                         pdf_paths.append(out_pdf)
                         title = page.title().strip() or "Untitled"
+                        all_links = page.evaluate("""() => {
+                            var links = [];
+                            var as = document.querySelectorAll('a[href]');
+                            as.forEach(function(a) {
+                                var cs = window.getComputedStyle(a);
+                                if (cs.display === 'none' || cs.visibility === 'hidden') return;
+                                var skipTags = ['script','style','noscript','header','footer','nav'];
+                                var p = a;
+                                var skip = false;
+                                while (p) { if (skipTags.indexOf(p.tagName.toLowerCase()) !== -1) { skip = true; break; } p = p.parentElement; }
+                                if (skip) return;
+                                var text = a.textContent.trim();
+                                if (text && text.length > 1) links.push({text: text, href: a.href});
+                            });
+                            return links;
+                        }""")
                         body_text = page.inner_text("body").strip()
                         doc = docx.Document()
                         section = doc.sections[0]
@@ -570,11 +651,36 @@ def _download_worker(job_id: str, links: list[str], q: queue.Queue) -> None:
                         section.left_margin = Inches(1); section.right_margin = Inches(1)
                         heading = doc.add_heading(title, level=1)
                         heading.runs[0].font.size = Pt(16)
+                        pairs = []
+                        for link in (all_links or []):
+                            t = link.get("text", "").strip()
+                            h = link.get("href", "")
+                            if t and h and len(t) > 2:
+                                pairs.append((t, h))
+                        pairs.sort(key=lambda x: -len(x[0]))
                         for para_text in body_text.split("\n"):
                             line = para_text.strip()
-                            if line:
-                                p = doc.add_paragraph(line)
-                                p.style.font.size = Pt(11)
+                            if not line:
+                                continue
+                            p_para = doc.add_paragraph()
+                            remaining = line
+                            while remaining:
+                                matched = False
+                                for link_text, link_href in pairs:
+                                    idx = remaining.find(link_text)
+                                    if idx != -1:
+                                        if idx > 0:
+                                            prefix = remaining[:idx]
+                                            run = p_para.add_run(prefix)
+                                            run.font.size = Pt(11)
+                                        _add_hyperlink(p_para, link_text, link_href)
+                                        remaining = remaining[idx + len(link_text):]
+                                        matched = True
+                                        break
+                                if not matched:
+                                    run = p_para.add_run(remaining)
+                                    run.font.size = Pt(11)
+                                    remaining = ""
                         doc.save(str(out_docx))
                         docx_paths.append(out_docx)
                         render_count += 1
