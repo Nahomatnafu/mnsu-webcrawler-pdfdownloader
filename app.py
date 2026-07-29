@@ -628,60 +628,65 @@ def _download_worker(job_id: str, links: list[str], q: queue.Queue) -> None:
                                  margin={"top": "1cm", "bottom": "1cm", "left": "1cm", "right": "1cm"})
                         pdf_paths.append(out_pdf)
                         title = page.title().strip() or "Untitled"
-                        all_links = page.evaluate("""() => {
-                            var links = [];
-                            var as = document.querySelectorAll('a[href]');
-                            as.forEach(function(a) {
-                                var cs = window.getComputedStyle(a);
-                                if (cs.display === 'none' || cs.visibility === 'hidden') return;
-                                var skipTags = ['script','style','noscript','header','footer','nav'];
-                                var p = a;
-                                var skip = false;
-                                while (p) { if (skipTags.indexOf(p.tagName.toLowerCase()) !== -1) { skip = true; break; } p = p.parentElement; }
-                                if (skip) return;
-                                var text = a.textContent.trim();
-                                if (text && text.length > 1) links.push({text: text, href: a.href});
-                            });
-                            return links;
+                        structured = page.evaluate("""() => {
+                            var results = [];
+                            var skipTags = ['SCRIPT','STYLE','NOSCRIPT','HEADER','FOOTER','NAV','IMG','SVG','VIDEO','AUDIO','CANVAS','IFRAME','PICTURE','FIGURE'];
+                            var blockTags = ['P','H1','H2','H3','H4','H5','H6','LI','DIV','SECTION','ARTICLE','MAIN','BLOCKQUOTE','TD','TH'];
+                            function isSkipped(el) {
+                                while (el) {
+                                    if (skipTags.indexOf(el.tagName) !== -1) return true;
+                                    el = el.parentElement;
+                                }
+                                return false;
+                            }
+                            function getBlock(el) {
+                                while (el) {
+                                    if (blockTags.indexOf(el.tagName) !== -1) return el;
+                                    el = el.parentElement;
+                                }
+                                return null;
+                            }
+                            function getLink(el) {
+                                while (el) {
+                                    if (el.tagName === 'A' && el.href) return el.href;
+                                    el = el.parentElement;
+                                }
+                                return '';
+                            }
+                            var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
+                            var node;
+                            var currentBlock = null;
+                            var currentItems = [];
+                            function flush() {
+                                if (currentItems.length) {
+                                    var text = currentItems.map(function(x){return x.text;}).join(' ').trim();
+                                    if (text) {
+                                        var href = '';
+                                        for (var i = 0; i < currentItems.length; i++) {
+                                            if (currentItems[i].href) { href = currentItems[i].href; break; }
+                                        }
+                                        results.push({text: text, href: href, tag: currentBlock.tagName.toLowerCase()});
+                                    }
+                                }
+                                currentItems = [];
+                            }
+                            while (node = walker.nextNode()) {
+                                var text = node.textContent.trim();
+                                if (!text || text.length < 2) continue;
+                                var el = node.parentElement;
+                                if (!el || isSkipped(el)) continue;
+                                var block = getBlock(el);
+                                if (!block) continue;
+                                if (block !== currentBlock) {
+                                    flush();
+                                    currentBlock = block;
+                                }
+                                currentItems.push({text: text, href: getLink(el)});
+                            }
+                            flush();
+                            return results;
                         }""")
-                        body_text = page.inner_text("body").strip()
-                        doc = docx.Document()
-                        section = doc.sections[0]
-                        section.top_margin = Inches(1); section.bottom_margin = Inches(1)
-                        section.left_margin = Inches(1); section.right_margin = Inches(1)
-                        heading = doc.add_heading(title, level=1)
-                        heading.runs[0].font.size = Pt(16)
-                        pairs = []
-                        for link in (all_links or []):
-                            t = link.get("text", "").strip()
-                            h = link.get("href", "")
-                            if t and h and len(t) > 2:
-                                pairs.append((t, h))
-                        pairs.sort(key=lambda x: -len(x[0]))
-                        for para_text in body_text.split("\n"):
-                            line = para_text.strip()
-                            if not line:
-                                continue
-                            p_para = doc.add_paragraph()
-                            remaining = line
-                            while remaining:
-                                matched = False
-                                for link_text, link_href in pairs:
-                                    idx = remaining.find(link_text)
-                                    if idx != -1:
-                                        if idx > 0:
-                                            prefix = remaining[:idx]
-                                            run = p_para.add_run(prefix)
-                                            run.font.size = Pt(11)
-                                        _add_hyperlink(p_para, link_text, link_href)
-                                        remaining = remaining[idx + len(link_text):]
-                                        matched = True
-                                        break
-                                if not matched:
-                                    run = p_para.add_run(remaining)
-                                    run.font.size = Pt(11)
-                                    remaining = ""
-                        doc.save(str(out_docx))
+                        _build_docx_from_content(title, structured, out_docx)
                         docx_paths.append(out_docx)
                         render_count += 1
                         size_kb = round(out_pdf.stat().st_size / 1024, 1)
