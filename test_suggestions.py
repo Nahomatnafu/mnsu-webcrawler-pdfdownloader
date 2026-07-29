@@ -86,6 +86,75 @@ class TestAiFallbacks(unittest.TestCase):
         self.assertFalse(self.app.is_credit_error(Exception("temporary network error")))
 
 
+class TestDocxHyperlinks(unittest.TestCase):
+    NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+
+    @classmethod
+    def setUpClass(cls):
+        import app
+        cls.app = app
+
+    def _build(self, structured, title="Test Page"):
+        import tempfile, docx
+        from pathlib import Path
+        tmp = Path(tempfile.mkdtemp()) / "out.docx"
+        self.app._build_docx_from_content(title, structured, tmp)
+        return docx.Document(str(tmp))
+
+    def _hyperlink_texts(self, doc):
+        out = []
+        for para in doc.paragraphs:
+            for h in para._p.findall(self.NS + "hyperlink"):
+                out.append("".join(t.text or "" for t in h.iter(self.NS + "t")).strip())
+        return out
+
+    def test_only_anchor_text_becomes_hyperlink(self):
+        structured = [{"tag": "p", "runs": [
+            {"text": "Questions? Contact", "href": ""},
+            {"text": "Residential Life", "href": "https://example.edu/reslife/"},
+            {"text": "for details.", "href": ""},
+        ]}]
+        doc = self._build(structured)
+        self.assertEqual(self._hyperlink_texts(doc), ["Residential Life"])
+        full = " ".join(p.text for p in doc.paragraphs)
+        self.assertIn("Questions? Contact", full)
+        self.assertIn("for details.", full)
+
+    def test_multiple_links_in_one_block_all_preserved(self):
+        structured = [{"tag": "p", "runs": [
+            {"text": "Home", "href": "https://example.edu/"},
+            {"text": "University Life", "href": "https://example.edu/university-life/"},
+            {"text": "Housing", "href": "https://example.edu/housing/"},
+        ]}]
+        doc = self._build(structured)
+        self.assertEqual(
+            self._hyperlink_texts(doc),
+            ["Home", "University Life", "Housing"],
+        )
+
+    def test_javascript_href_is_not_linked(self):
+        structured = [{"tag": "p", "runs": [
+            {"text": "Open menu", "href": "javascript:void(0)"},
+        ]}]
+        doc = self._build(structured)
+        self.assertEqual(self._hyperlink_texts(doc), [])
+        self.assertIn("Open menu", " ".join(p.text for p in doc.paragraphs))
+
+    def test_hyperlink_relationships_are_external(self):
+        structured = [{"tag": "li", "runs": [
+            {"text": "Email us", "href": "mailto:reslife@mnsu.edu"},
+        ]}]
+        doc = self._build(structured)
+        rels = [r for r in doc.part.rels.values() if "hyperlink" in r.reltype]
+        self.assertTrue(rels)
+        self.assertTrue(all(r.is_external for r in rels))
+        self.assertIn("mailto:reslife@mnsu.edu", [r.target_ref for r in rels])
+
+    def test_title_is_first_heading(self):
+        doc = self._build([{"tag": "p", "runs": [{"text": "Body text here", "href": ""}]}], title="My Title")
+        self.assertEqual(doc.paragraphs[0].text, "My Title")
+
+
 class TestUrlToFilepath(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

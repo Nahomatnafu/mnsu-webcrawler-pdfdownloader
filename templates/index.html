@@ -143,11 +143,11 @@
 
     <!-- Panel: Download -->
     <div class="panel" id="panel-download">
-      <div class="section-label" id="progress-label">Generating PDFs…</div>
+      <div class="section-label" id="progress-label">Generating PDFs and DOCXs…</div>
       <div class="progress-bar-wrap"><div class="progress-bar" id="progress-bar"></div></div>
       <ul class="link-list" id="progress-list"></ul>
       <div class="actions">
-        <a id="dl-zip-btn" class="hidden"><button class="btn-dl">⬇ Download ZIP</button></a>
+        <a id="dl-zip-btn" class="hidden"><button class="btn-dl">⬇ Download ZIP (PDF + DOCX)</button></a>
         <button class="btn-excel hidden" id="dl-excel-btn" onclick="exportExcel()">📊 Export Excel</button>
         <button class="btn-cancel hidden" id="cancel-download-btn" onclick="cancelJob('download')">Cancel</button>
       </div>
@@ -406,7 +406,6 @@
           const dlBtn = document.getElementById('dl-zip-btn');
           dlBtn.href = `${API_BASE}/get-zip/${job_id}`; dlBtn.classList.remove('hidden');
           document.getElementById('dl-excel-btn').classList.remove('hidden');
-          document.getElementById('dl-docx-btn').classList.remove('hidden');
           document.getElementById('download-btn').disabled = false;
           finishJob('download');
         }

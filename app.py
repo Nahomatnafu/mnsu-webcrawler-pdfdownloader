@@ -528,35 +528,45 @@ def _build_docx_from_content(title, structured, out_path):
     section.top_margin = Inches(1); section.bottom_margin = Inches(1)
     section.left_margin = Inches(1); section.right_margin = Inches(1)
     heading = doc.add_heading(title, level=1)
-    heading.runs[0].font.size = Pt(16)
-    for item in structured:
+    if heading.runs:
+        heading.runs[0].font.size = Pt(16)
+    for item in (structured or []):
         if not isinstance(item, dict):
             continue
-        t = (item.get("text") or "").strip()
-        link = item.get("href", "")
         tag = (item.get("tag") or "").lower()
-        if not t:
+        segments = []
+        for raw in (item.get("runs") or []):
+            if not isinstance(raw, dict):
+                continue
+            text = " ".join((raw.get("text") or "").split())
+            if not text:
+                continue
+            href = (raw.get("href") or "").strip()
+            if href.lower().startswith("javascript:"):
+                href = ""
+            segments.append((text, href))
+        if not segments:
             continue
-        if tag in ("h2",):
-            h = doc.add_heading(t, level=2)
-            for run in h.runs:
-                run.font.size = Pt(13)
-        elif tag in ("h3",):
-            h = doc.add_heading(t, level=3)
-            for run in h.runs:
-                run.font.size = Pt(12)
+        if tag in ("h1", "h2"):
+            para = doc.add_heading("", level=2); size = Pt(13)
+        elif tag == "h3":
+            para = doc.add_heading("", level=3); size = Pt(12)
+        elif tag in ("h4", "h5", "h6"):
+            para = doc.add_heading("", level=4); size = Pt(11)
         elif tag == "li":
-            p = doc.add_paragraph(t, style="List Bullet")
-            if link:
-                p.clear()
-                _add_hyperlink(p, t, link)
+            para = doc.add_paragraph(style="List Bullet"); size = Pt(11)
         else:
-            p = doc.add_paragraph()
-            if link:
-                _add_hyperlink(p, t, link)
-            else:
-                run = p.add_run(t)
-                run.font.size = Pt(11)
+            para = doc.add_paragraph(); size = Pt(11)
+        for idx, (text, href) in enumerate(segments):
+            piece = text if idx == 0 else " " + text
+            if href:
+                try:
+                    _add_hyperlink(para, piece, href)
+                    continue
+                except Exception:
+                    pass
+            run = para.add_run(piece)
+            run.font.size = size
     doc.save(str(out_path))
 
 
@@ -648,40 +658,48 @@ def _download_worker(job_id: str, links: list[str], q: queue.Queue) -> None:
                             }
                             function getLink(el) {
                                 while (el) {
-                                    if (el.tagName === 'A' && el.href) return el.href;
+                                    if (el.tagName === 'A' && el.href) {
+                                        var h = el.getAttribute('href') || '';
+                                        if (h.toLowerCase().indexOf('javascript:') === 0) return '';
+                                        return el.href;
+                                    }
                                     el = el.parentElement;
                                 }
                                 return '';
                             }
                             var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
-                            var node;
-                            var currentBlock = null;
-                            var currentItems = [];
+                            var node, currentBlock = null, pending = [];
                             function flush() {
-                                if (currentItems.length) {
-                                    var text = currentItems.map(function(x){return x.text;}).join(' ').trim();
-                                    if (text) {
-                                        var href = '';
-                                        for (var i = 0; i < currentItems.length; i++) {
-                                            if (currentItems[i].href) { href = currentItems[i].href; break; }
-                                        }
-                                        results.push({text: text, href: href, tag: currentBlock.tagName.toLowerCase()});
+                                var merged = [];
+                                for (var i = 0; i < pending.length; i++) {
+                                    var seg = pending[i];
+                                    if (!seg.text) continue;
+                                    var last = merged.length ? merged[merged.length - 1] : null;
+                                    if (last && last.href === seg.href) {
+                                        last.text = last.text + ' ' + seg.text;
+                                    } else {
+                                        merged.push({text: seg.text, href: seg.href});
                                     }
                                 }
-                                currentItems = [];
+                                if (merged.length && currentBlock) {
+                                    results.push({tag: currentBlock.tagName.toLowerCase(), runs: merged});
+                                }
+                                pending = [];
                             }
                             while (node = walker.nextNode()) {
                                 var text = node.textContent.trim();
-                                if (!text || text.length < 2) continue;
+                                if (!text) continue;
                                 var el = node.parentElement;
                                 if (!el || isSkipped(el)) continue;
+                                var cs = window.getComputedStyle(el);
+                                if (cs && (cs.display === 'none' || cs.visibility === 'hidden')) continue;
                                 var block = getBlock(el);
                                 if (!block) continue;
                                 if (block !== currentBlock) {
                                     flush();
                                     currentBlock = block;
                                 }
-                                currentItems.push({text: text, href: getLink(el)});
+                                pending.push({text: text, href: getLink(el)});
                             }
                             flush();
                             return results;
