@@ -496,55 +496,39 @@ def _scrape_worker(job_id: str, start_url: str, q: queue.Queue,
         emit_terminal(q, job_id, {"type": "fatal", "reason": str(e)})
 
 
-def _pdf_worker(job_id: str, links: list[str], q: queue.Queue) -> None:
-    """Background thread: render each URL to PDF, save with mirrored structure, zip, signal done."""
+def _download_worker(job_id: str, links: list[str], q: queue.Queue) -> None:
     manifest = load_manifest()
-    pdf_paths: list[Path] = []
-
+    pdf_paths = []
+    docx_paths = []
     try:
         with sync_playwright() as pw:
             browser = pw.chromium.launch(args=["--no-sandbox", "--disable-setuid-sandbox"])
-            context = None
-            page = None
-            render_count = 0
-
+            context = None; page = None; render_count = 0
             def open_page():
-                ctx = browser.new_context(
-                    user_agent="Mozilla/5.0 AppleWebKit/537.36 Chrome/120 Safari/537.36"
-                )
+                ctx = browser.new_context(user_agent="Mozilla/5.0 AppleWebKit/537.36 Chrome/120 Safari/537.36")
                 ctx.route("**/*", lambda route: block_resource_route(route))
                 return ctx, ctx.new_page()
-
             def close_page():
-                if page:
-                    page.close()
-                if context:
-                    context.close()
-
+                if page: page.close()
+                if context: context.close()
             context, page = open_page()
             try:
                 for i, url in enumerate(links, 1):
                     if should_stop(job_id):
-                        emit_terminal(q, job_id, {"type": "cancelled", "reason": "PDF generation cancelled."})
+                        emit_terminal(q, job_id, {"type": "cancelled", "reason": "Download cancelled."})
                         return
                     if url in manifest:
-                        q.put({"type": "skipped", "current": i, "total": len(links), "url": url,
-                               "file": manifest[url]["file"]})
+                        q.put({"type": "skipped", "current": i, "total": len(links), "url": url, "file": manifest[url]["file"]})
                         continue
-
                     if render_count and render_count % PDF_PAGE_RECYCLE == 0:
-                        close_page()
-                        context, page = open_page()
-                        q.put({"type": "status", "message": f"Recycled browser after {render_count} PDFs…"})
-
-                    update_job_status(job_id, stage="pdf_rendering", current=i, total=len(links), current_url=url,
-                                      rendered=render_count, errors=jobs[job_id].get("status", {}).get("errors", 0))
+                        close_page(); context, page = open_page()
+                        q.put({"type": "status", "message": f"Recycled browser after {render_count} pages"})
+                    update_job_status(job_id, stage="rendering", current=i, total=len(links), current_url=url, rendered=render_count)
                     q.put({"type": "progress", "current": i, "total": len(links), "url": url})
-
-                    rel_path = url_to_filepath(url)
-                    out = OUTPUT_DIR / rel_path
-                    out.parent.mkdir(parents=True, exist_ok=True)
-
+                    rel_pdf = url_to_filepath(url); out_pdf = OUTPUT_DIR / "pdf" / rel_pdf
+                    rel_docx = url_to_filepath(url).with_suffix(".docx"); out_docx = OUTPUT_DIR / "docx" / rel_docx
+                    out_pdf.parent.mkdir(parents=True, exist_ok=True)
+                    out_docx.parent.mkdir(parents=True, exist_ok=True)
                     try:
                         page.emulate_media(media="screen")
                         page.goto(url, wait_until="domcontentloaded", timeout=PDF_NAV_TIMEOUT)
@@ -552,7 +536,8 @@ def _pdf_worker(job_id: str, links: list[str], q: queue.Queue) -> None:
                         page.add_style_tag(content="""
                             header, nav, .nav, .navbar, .site-header,
                             footer, .footer, .site-footer,
-                            .cookie-banner, .chat-widget, [class*="overlay"] {
+                            .cookie-banner, .chat-widget, [class*="overlay"],
+                            script, style, noscript {
                                 display: none !important;
                             }
                             img, svg, video, audio, canvas,
@@ -574,132 +559,56 @@ def _pdf_worker(job_id: str, links: list[str], q: queue.Queue) -> None:
                                 break-inside: avoid;
                             }
                         """)
-
-                        page.pdf(
-                            path=str(out), format="A4", print_background=True,
-                            scale=0.9,
-                            margin={"top": "1cm", "bottom": "1cm", "left": "1cm", "right": "1cm"},
-                        )
-                        pdf_paths.append(out)
-                        render_count += 1
-                        size_kb = round(out.stat().st_size / 1024, 1)
-                        manifest[url] = {
-                            "url": url,
-                            "file": str(rel_path),
-                            "scraped_at": datetime.now().isoformat(timespec="seconds"),
-                            "status": "ok",
-                            "size_kb": size_kb,
-                        }
-                        save_manifest(manifest)
-
-                        update_job_status(job_id, stage="pdf_done", current=i, total=len(links), current_url=url,
-                                          rendered=render_count, last_file=str(rel_path))
-                        q.put({"type": "done_one", "url": url,
-                               "file": str(rel_path), "size_kb": size_kb})
-                    except Exception as e:
-                        current_status = jobs[job_id].get("status", {})
-                        error_count = current_status.get("errors", 0) + 1
-                        update_job_status(job_id, stage="pdf_error", current=i, total=len(links), current_url=url,
-                                          rendered=render_count, errors=error_count, last_error=str(e)[:200])
-                        q.put({"type": "error_one", "url": url, "reason": str(e)})
-
-                    if i < len(links):
-                        time.sleep(0.4)
-            finally:
-                close_page()
-                browser.close()
-
-        if should_stop(job_id):
-            emit_terminal(q, job_id, {"type": "cancelled", "reason": "PDF generation cancelled."})
-            return
-
-        update_job_status(job_id, stage="zipping", rendered=render_count, total=len(links))
-        q.put({"type": "status", "message": "Creating ZIP file..."})
-        zip_path = OUTPUT_DIR / f"pages-{job_id}-{timestamp_slug()}.zip"
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            for i, p in enumerate(pdf_paths, 1):
-                zf.write(p, p.relative_to(OUTPUT_DIR))
-                if i % 20 == 0:  # Status update every 20 files
-                    q.put({"type": "status", "message": f"Compressing ZIP… {i}/{len(pdf_paths)}"})
-        jobs[job_id]["zip_path"] = str(zip_path)
-        emit_terminal(q, job_id, {"type": "complete"})
-
-    except Exception as e:
-        emit_terminal(q, job_id, {"type": "fatal", "reason": str(e)})
-
-
-
-def _docx_worker(job_id: str, links: list[str], q: queue.Queue) -> None:
-    manifest = load_manifest()
-    docx_paths = []
-    try:
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(args=['--no-sandbox', '--disable-setuid-sandbox'])
-            context = None; page = None; render_count = 0
-            def open_page():
-                ctx = browser.new_context(user_agent='Mozilla/5.0 AppleWebKit/537.36 Chrome/120 Safari/537.36')
-                ctx.route('**/*', lambda route: block_resource_route(route))
-                return ctx, ctx.new_page()
-            def close_page():
-                if page: page.close()
-                if context: context.close()
-            context, page = open_page()
-            try:
-                for i, url in enumerate(links, 1):
-                    if should_stop(job_id):
-                        emit_terminal(q, job_id, {'type': 'cancelled', 'reason': 'DOCX generation cancelled.'})
-                        return
-                    if render_count and render_count % PDF_PAGE_RECYCLE == 0:
-                        close_page(); context, page = open_page()
-                        q.put({'type': 'status', 'message': f'Recycled browser after {render_count} DOCXs'})
-                    update_job_status(job_id, stage='docx_rendering', current=i, total=len(links), current_url=url, rendered=render_count)
-                    q.put({'type': 'progress', 'current': i, 'total': len(links), 'url': url})
-                    rel_path = url_to_filepath(url).with_suffix('.docx')
-                    out = OUTPUT_DIR / rel_path
-                    out.parent.mkdir(parents=True, exist_ok=True)
-                    try:
-                        page.emulate_media(media='screen')
-                        page.goto(url, wait_until='domcontentloaded', timeout=PDF_NAV_TIMEOUT)
-                        page.wait_for_timeout(PDF_SETTLE_MS)
-                        title = page.title().strip() or 'Untitled'
-                        body_text = page.inner_text('body').strip()
+                        page.pdf(path=str(out_pdf), format="A4", print_background=True, scale=0.9,
+                                 margin={"top": "1cm", "bottom": "1cm", "left": "1cm", "right": "1cm"})
+                        pdf_paths.append(out_pdf)
+                        title = page.title().strip() or "Untitled"
+                        body_text = page.inner_text("body").strip()
                         doc = docx.Document()
                         section = doc.sections[0]
                         section.top_margin = Inches(1); section.bottom_margin = Inches(1)
                         section.left_margin = Inches(1); section.right_margin = Inches(1)
                         heading = doc.add_heading(title, level=1)
                         heading.runs[0].font.size = Pt(16)
-                        for para_text in body_text.split('\n'):
+                        for para_text in body_text.split("\n"):
                             line = para_text.strip()
                             if line:
                                 p = doc.add_paragraph(line)
                                 p.style.font.size = Pt(11)
-                        doc.save(str(out))
-                        docx_paths.append(out); render_count += 1
-                        size_kb = round(out.stat().st_size / 1024, 1)
-                        update_job_status(job_id, stage='docx_done', current=i, total=len(links), current_url=url, rendered=render_count)
-                        q.put({'type': 'done_one', 'url': url, 'file': str(rel_path), 'size_kb': size_kb})
+                        doc.save(str(out_docx))
+                        docx_paths.append(out_docx)
+                        render_count += 1
+                        size_kb = round(out_pdf.stat().st_size / 1024, 1)
+                        manifest[url] = {"url": url, "file": str(rel_pdf), "scraped_at": datetime.now().isoformat(timespec="seconds"), "status": "ok", "size_kb": size_kb}
+                        save_manifest(manifest)
+                        update_job_status(job_id, stage="done", current=i, total=len(links), current_url=url, rendered=render_count)
+                        q.put({"type": "done_one", "url": url, "file": str(rel_pdf), "size_kb": size_kb})
                     except Exception as e:
-                        q.put({'type': 'error_one', 'url': url, 'reason': str(e)})
+                        q.put({"type": "error_one", "url": url, "reason": str(e)})
                     if i < len(links):
                         time.sleep(0.4)
             finally:
                 close_page(); browser.close()
         if should_stop(job_id):
-            emit_terminal(q, job_id, {'type': 'cancelled', 'reason': 'DOCX generation cancelled.'})
+            emit_terminal(q, job_id, {"type": "cancelled", "reason": "Download cancelled."})
             return
-        update_job_status(job_id, stage='zipping', rendered=render_count, total=len(links))
-        q.put({'type': 'status', 'message': 'Creating DOCX ZIP file...'})
-        zip_path = OUTPUT_DIR / f'docx-{job_id}-{timestamp_slug()}.zip'
-        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-            for i2, p in enumerate(docx_paths, 1):
+        update_job_status(job_id, stage="zipping", rendered=render_count, total=len(links))
+        q.put({"type": "status", "message": "Creating combined ZIP file..."})
+        zip_path = OUTPUT_DIR / f"archive-{job_id}-{timestamp_slug()}.zip"
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for i2, p in enumerate(pdf_paths, 1):
                 zf.write(p, p.relative_to(OUTPUT_DIR))
-                if i2 % 20 == 0:
-                    q.put({'type': 'status', 'message': f'Compressing ZIP {i2}/{len(docx_paths)}'})
-        jobs[job_id]['docx_zip_path'] = str(zip_path)
-        emit_terminal(q, job_id, {'type': 'complete'})
+                if i2 % 30 == 0:
+                    q.put({"type": "status", "message": f"Compressing ZIP... {i2}/{len(pdf_paths)}"})
+            for i2, d in enumerate(docx_paths, 1):
+                zf.write(d, d.relative_to(OUTPUT_DIR))
+                if i2 % 30 == 0:
+                    q.put({"type": "status", "message": f"Compressing ZIP... {len(pdf_paths) + i2}/{len(pdf_paths) + len(docx_paths)}"})
+        jobs[job_id]["zip_path"] = str(zip_path)
+        emit_terminal(q, job_id, {"type": "complete"})
     except Exception as e:
-        emit_terminal(q, job_id, {'type': 'fatal', 'reason': str(e)})
+        emit_terminal(q, job_id, {"type": "fatal", "reason": str(e)})
+
 
 def export_excel(links: list[dict], start_url: str) -> Path:
     """
@@ -1205,7 +1114,7 @@ def start_download():
     q: queue.Queue = queue.Queue()
     if not register_job(job_id, {"type": "download", "queue": q, "zip_path": None}):
         return jsonify({"error": "Too many active jobs. Wait for the current job to finish, then try again."}), 429
-    threading.Thread(target=_pdf_worker, args=(job_id, links, q), daemon=True).start()
+    threading.Thread(target=_download_worker, args=(job_id, links, q), daemon=True).start()
     return jsonify({"job_id": job_id})
 
 
@@ -1239,27 +1148,6 @@ def get_zip(job_id: str):
     if not job or not job.get("zip_path"):
         return "Not ready", 404
     return send_file(job["zip_path"], as_attachment=True, download_name=f"pages_{timestamp_slug()}.zip")
-
-
-@app.route("/start-download-docx", methods=["POST"])
-def start_download_docx():
-    links = (request.json or {}).get("links", [])
-    if not links:
-        return jsonify({"error": "No links provided"}), 400
-    job_id = str(uuid.uuid4())
-    q = queue.Queue()
-    if not register_job(job_id, {"type": "download-docx", "queue": q, "docx_zip_path": None}):
-        return jsonify({"error": "Too many active jobs. Wait for the current job to finish, then try again."}), 429
-    threading.Thread(target=_docx_worker, args=(job_id, links, q), daemon=True).start()
-    return jsonify({"job_id": job_id})
-
-
-@app.route("/get-docx-zip/<job_id>")
-def get_docx_zip(job_id: str):
-    job = jobs.get(job_id)
-    if not job or not job.get("docx_zip_path"):
-        return "Not ready", 404
-    return send_file(job["docx_zip_path"], as_attachment=True, download_name=f"pages_{timestamp_slug()}.docx.zip")
 
 
 @app.route("/export-excel", methods=["POST"])
