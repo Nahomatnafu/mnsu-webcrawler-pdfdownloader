@@ -12,6 +12,8 @@ from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
 
 import anthropic
+import docx
+from docx.shared import Pt, Inches
 import openpyxl
 from dotenv import load_dotenv
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -626,6 +628,79 @@ def _pdf_worker(job_id: str, links: list[str], q: queue.Queue) -> None:
         emit_terminal(q, job_id, {"type": "fatal", "reason": str(e)})
 
 
+
+def _docx_worker(job_id: str, links: list[str], q: queue.Queue) -> None:
+    manifest = load_manifest()
+    docx_paths = []
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(args=['--no-sandbox', '--disable-setuid-sandbox'])
+            context = None; page = None; render_count = 0
+            def open_page():
+                ctx = browser.new_context(user_agent='Mozilla/5.0 AppleWebKit/537.36 Chrome/120 Safari/537.36')
+                ctx.route('**/*', lambda route: block_resource_route(route))
+                return ctx, ctx.new_page()
+            def close_page():
+                if page: page.close()
+                if context: context.close()
+            context, page = open_page()
+            try:
+                for i, url in enumerate(links, 1):
+                    if should_stop(job_id):
+                        emit_terminal(q, job_id, {'type': 'cancelled', 'reason': 'DOCX generation cancelled.'})
+                        return
+                    if render_count and render_count % PDF_PAGE_RECYCLE == 0:
+                        close_page(); context, page = open_page()
+                        q.put({'type': 'status', 'message': f'Recycled browser after {render_count} DOCXs'})
+                    update_job_status(job_id, stage='docx_rendering', current=i, total=len(links), current_url=url, rendered=render_count)
+                    q.put({'type': 'progress', 'current': i, 'total': len(links), 'url': url})
+                    rel_path = url_to_filepath(url).with_suffix('.docx')
+                    out = OUTPUT_DIR / rel_path
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    try:
+                        page.emulate_media(media='screen')
+                        page.goto(url, wait_until='domcontentloaded', timeout=PDF_NAV_TIMEOUT)
+                        page.wait_for_timeout(PDF_SETTLE_MS)
+                        title = page.title().strip() or 'Untitled'
+                        body_text = page.inner_text('body').strip()
+                        doc = docx.Document()
+                        section = doc.sections[0]
+                        section.top_margin = Inches(1); section.bottom_margin = Inches(1)
+                        section.left_margin = Inches(1); section.right_margin = Inches(1)
+                        heading = doc.add_heading(title, level=1)
+                        heading.runs[0].font.size = Pt(16)
+                        for para_text in body_text.split('\n'):
+                            line = para_text.strip()
+                            if line:
+                                p = doc.add_paragraph(line)
+                                p.style.font.size = Pt(11)
+                        doc.save(str(out))
+                        docx_paths.append(out); render_count += 1
+                        size_kb = round(out.stat().st_size / 1024, 1)
+                        update_job_status(job_id, stage='docx_done', current=i, total=len(links), current_url=url, rendered=render_count)
+                        q.put({'type': 'done_one', 'url': url, 'file': str(rel_path), 'size_kb': size_kb})
+                    except Exception as e:
+                        q.put({'type': 'error_one', 'url': url, 'reason': str(e)})
+                    if i < len(links):
+                        time.sleep(0.4)
+            finally:
+                close_page(); browser.close()
+        if should_stop(job_id):
+            emit_terminal(q, job_id, {'type': 'cancelled', 'reason': 'DOCX generation cancelled.'})
+            return
+        update_job_status(job_id, stage='zipping', rendered=render_count, total=len(links))
+        q.put({'type': 'status', 'message': 'Creating DOCX ZIP file...'})
+        zip_path = OUTPUT_DIR / f'docx-{job_id}-{timestamp_slug()}.zip'
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for i2, p in enumerate(docx_paths, 1):
+                zf.write(p, p.relative_to(OUTPUT_DIR))
+                if i2 % 20 == 0:
+                    q.put({'type': 'status', 'message': f'Compressing ZIP {i2}/{len(docx_paths)}'})
+        jobs[job_id]['docx_zip_path'] = str(zip_path)
+        emit_terminal(q, job_id, {'type': 'complete'})
+    except Exception as e:
+        emit_terminal(q, job_id, {'type': 'fatal', 'reason': str(e)})
+
 def export_excel(links: list[dict], start_url: str) -> Path:
     """
     Build an Excel workbook from the scraped link list.
@@ -1166,7 +1241,29 @@ def get_zip(job_id: str):
     return send_file(job["zip_path"], as_attachment=True, download_name=f"pages_{timestamp_slug()}.zip")
 
 
+@app.route("/start-download-docx", methods=["POST"])
+def start_download_docx():
+    links = (request.json or {}).get("links", [])
+    if not links:
+        return jsonify({"error": "No links provided"}), 400
+    job_id = str(uuid.uuid4())
+    q = queue.Queue()
+    if not register_job(job_id, {"type": "download-docx", "queue": q, "docx_zip_path": None}):
+        return jsonify({"error": "Too many active jobs. Wait for the current job to finish, then try again."}), 429
+    threading.Thread(target=_docx_worker, args=(job_id, links, q), daemon=True).start()
+    return jsonify({"job_id": job_id})
+
+
+@app.route("/get-docx-zip/<job_id>")
+def get_docx_zip(job_id: str):
+    job = jobs.get(job_id)
+    if not job or not job.get("docx_zip_path"):
+        return "Not ready", 404
+    return send_file(job["docx_zip_path"], as_attachment=True, download_name=f"pages_{timestamp_slug()}.docx.zip")
+
+
 @app.route("/export-excel", methods=["POST"])
+
 def export_excel_route():
     """Generate and return an Excel file from the current link list + manifest."""
     data       = request.json or {}

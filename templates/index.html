@@ -148,7 +148,8 @@
       <ul class="link-list" id="progress-list"></ul>
       <div class="actions">
         <a id="dl-zip-btn" class="hidden"><button class="btn-dl">⬇ Download ZIP</button></a>
-        <button class="btn-excel hidden" id="dl-excel-btn" onclick="exportExcel()">📊 Export Excel</button>
+                <button class="btn-dl hidden" id="dl-docx-btn" onclick="startDocxDownload()">⬇ Download DOCX</button>
+<button class="btn-excel hidden" id="dl-excel-btn" onclick="exportExcel()">📊 Export Excel</button>
         <button class="btn-cancel hidden" id="cancel-download-btn" onclick="cancelJob('download')">Cancel</button>
       </div>
     </div>
@@ -406,6 +407,7 @@
           const dlBtn = document.getElementById('dl-zip-btn');
           dlBtn.href = `${API_BASE}/get-zip/${job_id}`; dlBtn.classList.remove('hidden');
           document.getElementById('dl-excel-btn').classList.remove('hidden');
+          document.getElementById('dl-docx-btn').classList.remove('hidden');
           document.getElementById('download-btn').disabled = false;
           finishJob('download');
         }
@@ -419,6 +421,85 @@
         if (activeJobs.download === job_id) {
           document.getElementById('progress-label').textContent = 'Connection interrupted; reconnecting…';
         }
+      };
+    }
+
+
+    var activeJobDocx = null;
+    var activeStreamDocx = null;
+
+    async function startDocxDownload() {
+      const newLinks = scrapedLinks.filter(l => true).map(l => l.url);
+      if (!newLinks.length) return;
+      document.getElementById('download-btn').disabled = true;
+      document.getElementById('progress-list').innerHTML = '';
+      document.getElementById('progress-bar').style.width = '0%';
+      document.getElementById('progress-label').textContent = 'Generating DOCX files…';
+      document.getElementById('dl-zip-btn').classList.add('hidden');
+      document.getElementById('dl-docx-btn').classList.add('hidden');
+      document.getElementById('dl-excel-btn').classList.add('hidden');
+      switchTab('download');
+
+      const res = await fetch(`${API_BASE}/start-download-docx`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ links: newLinks })
+      });
+      const data = await res.json();
+      if (data.error) {
+        document.getElementById('progress-label').textContent = 'Error: ' + data.error;
+        document.getElementById('download-btn').disabled = false;
+        return;
+      }
+      const job_id = data.job_id;
+      activeJobDocx = job_id;
+      var es = new EventSource(`${API_BASE}/progress/${job_id}`);
+      activeStreamDocx = es;
+      var progList = document.getElementById('progress-list');
+      var bar = document.getElementById('progress-bar');
+      var items = {};
+
+      es.onmessage = (e) => {
+        var evt = JSON.parse(e.data);
+        if (evt.type === 'progress') {
+          bar.style.width = Math.round((evt.current - 1) / evt.total * 100) + '%';
+          document.getElementById('progress-label').textContent = `Generating DOCX $${evt.current} of $${evt.total}…`;
+          var li = document.createElement('li'); li.textContent = evt.url; li.classList.add('active');
+          progList.appendChild(li); li.scrollIntoView({ block: 'nearest' }); items[evt.url] = li;
+        }
+        if (evt.type === 'skipped') {
+          var li = document.createElement('li'); li.classList.add('skipped');
+          li.textContent = `${evt.file}  (already downloaded)`; progList.appendChild(li);
+        }
+        if (evt.type === 'done_one') {
+          var li = items[evt.url];
+          if (li) { li.classList.replace('active', 'done'); li.textContent = `${evt.file}  (${evt.size_kb} KB)`; }
+        }
+        if (evt.type === 'error_one') {
+          var li = items[evt.url];
+          if (li) { li.classList.replace('active', 'fail'); li.textContent = `${evt.url} — ${evt.reason}`; }
+        }
+        if (evt.type === 'status') {
+          document.getElementById('progress-label').textContent = evt.message;
+        }
+        if (evt.type === 'complete') {
+          bar.style.width = '100%';
+          document.getElementById('progress-label').textContent = 'All DOCX files ready!';
+          var dlDocxBtn = document.getElementById('dl-docx-btn');
+          dlDocxBtn.href = `${API_BASE}/get-docx-zip/${job_id}`; dlDocxBtn.classList.remove('hidden');
+          document.getElementById('dl-excel-btn').classList.remove('hidden');
+          document.getElementById('download-btn').disabled = false;
+          if (activeStreamDocx) { activeStreamDocx.close(); activeStreamDocx = null; }
+          activeJobDocx = null;
+        }
+        if (evt.type === 'fatal') {
+          document.getElementById('progress-label').textContent = 'Error: ' + evt.reason;
+          document.getElementById('download-btn').disabled = false;
+          if (activeStreamDocx) { activeStreamDocx.close(); activeStreamDocx = null; }
+          activeJobDocx = null;
+        }
+      };
+      es.onerror = () => {
+        document.getElementById('progress-label').textContent = 'Connection interrupted; reconnecting…';
       };
     }
 
