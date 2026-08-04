@@ -158,7 +158,7 @@ SUGGEST_CACHE_DIR = DATA_DIR / "suggestion_cache"
 CRAWL_MAX_PAGES = env_int("CRAWL_MAX_PAGES", 1000, 1)
 SAFE_PATH_SEGMENT_MAX = env_int("SAFE_PATH_SEGMENT_MAX", 48, 16)
 SAFE_REL_PATH_MAX = env_int("SAFE_REL_PATH_MAX", 150, 80)
-print(f"[startup] Python {__import__("sys").version}", flush=True)
+print(f"[startup] Python 3", flush=True)
 for mod in ["docx", "anthropic", "openpyxl", "flask", "gunicorn", "playwright"]:
     try:
         __import__(mod)
@@ -1290,9 +1290,10 @@ def progress(job_id: str):
             if replay.get("type") == "analysis_complete":
                 analysis_results = job.get("analysis_results") or []
                 for r in analysis_results:
-                    yield f"data: {json.dumps({"type": "analysis_placeholder", **r})}\n\n"
-                    yield f"data: {json.dumps({"type": "analysis_upgrade", "index": r["index"], "page_name": r.get("page_name",""), "platform": r.get("platform",""), "confidence": r.get("confidence",""), "reason": r.get("reason",""), "done": len(analysis_results), "total": len(analysis_results)})}\n\n"
-            yield f"data: {json.dumps(replay)}\n\n"
+                    placeholder = {"type": "analysis_placeholder", **r}
+                    upgrade = {"type": "analysis_upgrade", "index": r["index"], "page_name": r.get("page_name",""), "platform": r.get("platform",""), "confidence": r.get("confidence",""), "reason": r.get("reason",""), "done": len(analysis_results), "total": len(analysis_results)}
+                    yield f"data: {json.dumps(placeholder)}\n\n"
+                    yield f"data: {json.dumps(upgrade)}\n\n"
             return
         while True:
             try:
