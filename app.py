@@ -1278,6 +1278,11 @@ def progress(job_id: str):
         if replay:
             if replay.get("type") == "complete" and job.get("type") == "scrape":
                 job["links"] = replay.get("links", [])
+            if replay.get("type") == "analysis_complete":
+                analysis_results = job.get("analysis_results") or []
+                for r in analysis_results:
+                    yield f"data: {json.dumps({"type": "analysis_placeholder", **r})}\n\n"
+                    yield f"data: {json.dumps({"type": "analysis_upgrade", "index": r["index"], "page_name": r.get("page_name",""), "platform": r.get("platform",""), "confidence": r.get("confidence",""), "reason": r.get("reason",""), "done": len(analysis_results), "total": len(analysis_results)})}\n\n"
             yield f"data: {json.dumps(replay)}\n\n"
             return
         while True:
