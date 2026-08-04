@@ -159,6 +159,44 @@ CRAWL_MAX_PAGES = env_int("CRAWL_MAX_PAGES", 1000, 1)
 SAFE_PATH_SEGMENT_MAX = env_int("SAFE_PATH_SEGMENT_MAX", 48, 16)
 SAFE_REL_PATH_MAX = env_int("SAFE_REL_PATH_MAX", 150, 80)
 
+# Site chrome that should never appear in an exported PDF/DOCX.  MNSU wraps its
+# yellow footer in .footer-background/.footer-wrap and the purple legal strip in
+# footer.sub-footer, so those containers are targeted explicitly.  The same list
+# drives the injected CSS (for the PDF) and the DOCX text extractor, so the two
+# formats can never disagree about what counts as boilerplate.
+BOILERPLATE_SELECTORS = ", ".join([
+    "header", "nav", ".nav", ".navbar", ".site-header",
+    "footer", ".footer", ".site-footer", ".sub-footer",
+    ".footer-background", ".footer-wrap",
+    ".foot-nav", ".foot-block", ".foot-text",
+    ".cookie-banner", ".chat-widget", "[class*=\"overlay\"]",
+    "script", "style", "noscript",
+])
+
+PAGE_CLEANUP_CSS = """
+""" + BOILERPLATE_SELECTORS + """ {
+    display: none !important;
+}
+img, svg, video, audio, canvas,
+[class*="icon"], [class*="logo"], [class*="banner"],
+[class*="hero"], [class*="thumbnail"], [class*="carousel"],
+[class*="slider"], [class*="gallery"], [class*="image"],
+picture, figure, iframe {
+    display: none !important;
+}
+* {
+    background-image: none !important;
+}
+[style*="position: fixed"], [style*="position:fixed"],
+[style*="position: sticky"], [style*="position:sticky"] {
+    position: static !important;
+}
+p, h1, h2, h3, h4, h5, h6, table, li, blockquote {
+    page-break-inside: avoid;
+    break-inside: avoid;
+}
+"""
+
 app = Flask(__name__)
 
 # ── CORS ─────────────────────────────────────────────────────────────────────
@@ -612,41 +650,17 @@ def _download_worker(job_id: str, links: list[str], q: queue.Queue) -> None:
                         page.emulate_media(media="screen")
                         page.goto(url, wait_until="domcontentloaded", timeout=PDF_NAV_TIMEOUT)
                         page.wait_for_timeout(PDF_SETTLE_MS)
-                        page.add_style_tag(content="""
-                            header, nav, .nav, .navbar, .site-header,
-                            footer, .footer, .site-footer,
-                            .cookie-banner, .chat-widget, [class*="overlay"],
-                            script, style, noscript {
-                                display: none !important;
-                            }
-                            img, svg, video, audio, canvas,
-                            [class*="icon"], [class*="logo"], [class*="banner"],
-                            [class*="hero"], [class*="thumbnail"], [class*="carousel"],
-                            [class*="slider"], [class*="gallery"], [class*="image"],
-                            picture, figure, iframe {
-                                display: none !important;
-                            }
-                            * {
-                                background-image: none !important;
-                            }
-                            [style*="position: fixed"], [style*="position:fixed"],
-                            [style*="position: sticky"], [style*="position:sticky"] {
-                                position: static !important;
-                            }
-                            p, h1, h2, h3, h4, h5, h6, table, li, blockquote {
-                                page-break-inside: avoid;
-                                break-inside: avoid;
-                            }
-                        """)
+                        page.add_style_tag(content=PAGE_CLEANUP_CSS)
                         page.pdf(path=str(out_pdf), format="A4", print_background=True, scale=0.9,
                                  margin={"top": "1cm", "bottom": "1cm", "left": "1cm", "right": "1cm"})
                         pdf_paths.append(out_pdf)
                         title = page.title().strip() or "Untitled"
-                        structured = page.evaluate("""() => {
+                        structured = page.evaluate("""(boilerplate) => {
                             var results = [];
                             var skipTags = ['SCRIPT','STYLE','NOSCRIPT','HEADER','FOOTER','NAV','IMG','SVG','VIDEO','AUDIO','CANVAS','IFRAME','PICTURE','FIGURE'];
                             var blockTags = ['P','H1','H2','H3','H4','H5','H6','LI','DIV','SECTION','ARTICLE','MAIN','BLOCKQUOTE','TD','TH'];
                             function isSkipped(el) {
+                                if (boilerplate && el.closest(boilerplate)) return true;
                                 while (el) {
                                     if (skipTags.indexOf(el.tagName) !== -1) return true;
                                     el = el.parentElement;
@@ -707,7 +721,7 @@ def _download_worker(job_id: str, links: list[str], q: queue.Queue) -> None:
                             }
                             flush();
                             return results;
-                        }""")
+                        }""", BOILERPLATE_SELECTORS)
                         _build_docx_from_content(title, structured, out_docx)
                         docx_paths.append(out_docx)
                         render_count += 1
