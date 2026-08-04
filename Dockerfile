@@ -22,4 +22,4 @@ ENV SAFE_PATH_SEGMENT_MAX=48
 ENV SAFE_REL_PATH_MAX=150
 ENV SSE_HEARTBEAT_SECONDS=20
 EXPOSE 5000
-CMD gunicorn -k gthread -w 1 --threads 8 --timeout 0 -b 0.0.0.0:${PORT} app:app
+CMD gunicorn -k gthread -w 1 --threads 8 --timeout 0 -b 0.0.0.0:${PORT} app:app --access-logfile - --error-logfile - --capture-output
