@@ -158,6 +158,15 @@ SUGGEST_CACHE_DIR = DATA_DIR / "suggestion_cache"
 CRAWL_MAX_PAGES = env_int("CRAWL_MAX_PAGES", 1000, 1)
 SAFE_PATH_SEGMENT_MAX = env_int("SAFE_PATH_SEGMENT_MAX", 48, 16)
 SAFE_REL_PATH_MAX = env_int("SAFE_REL_PATH_MAX", 150, 80)
+print(f"[startup] Python {__import__("sys").version}", flush=True)
+for mod in ["docx", "anthropic", "openpyxl", "flask", "gunicorn", "playwright"]:
+    try:
+        __import__(mod)
+        print(f"[startup] {mod}: ok", flush=True)
+    except Exception as e:
+        print(f"[startup] {mod}: FAIL - {e}", flush=True)
+print("[startup] app.py loaded, binding...", flush=True)
+
 
 # Site chrome that should never appear in an exported PDF/DOCX.  MNSU wraps its
 # yellow footer in .footer-background/.footer-wrap and the purple legal strip in
