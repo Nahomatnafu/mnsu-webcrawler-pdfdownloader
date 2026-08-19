@@ -90,6 +90,34 @@
     .conf-high   { color: #16a34a; font-weight: 700; }
     .conf-medium { color: #d97706; font-weight: 700; }
     .conf-low    { color: #dc2626; font-weight: 700; }
+
+    /* ── Analysis detail rows ── */
+    .chip-treatment { background: #e0e7ff; color: #3730a3; }
+    .chip-archive   { background: #fee2e2; color: #b91c1c; }
+    .chip-expert    { background: #fef3c7; color: #b45309; }
+    .prio-1 { color: #dc2626; font-weight: 700; }
+    .prio-2 { color: #d97706; font-weight: 700; }
+    .prio-3 { color: #2563eb; font-weight: 700; }
+    .prio-4 { color: #6b7280; font-weight: 600; }
+    .health-dots { display: inline-flex; gap: 3px; }
+    .health-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+    .hd-strong  { background: #16a34a; }
+    .hd-ok      { background: #84cc16; }
+    .hd-needs   { background: #f59e0b; }
+    .hd-concern { background: #dc2626; }
+    .hd-unknown { background: #d1d5db; }
+    .btn-detail { background: none; border: 1px solid #d1d5db; border-radius: 6px; cursor: pointer;
+                  font-size: 0.72rem; padding: 2px 7px; color: #4b5563; line-height: 1.4;
+                  white-space: nowrap; }
+    .btn-detail:hover { background: #f3f4f6; }
+    .detail-row > td { background: #f9fafb; border-bottom: 2px solid #e5e7eb; padding: 12px 16px; }
+    .detail-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px 22px; }
+    .detail-block { font-size: 0.78rem; line-height: 1.5; }
+    .detail-block h4 { margin: 0 0 3px; font-size: 0.68rem; text-transform: uppercase;
+                       letter-spacing: .04em; color: #6b7280; font-weight: 700; }
+    .detail-block ul { margin: 0; padding-left: 18px; }
+    .detail-block .muted { color: #9ca3af; }
+    .detail-health { display: grid; grid-template-columns: auto 1fr; gap: 2px 8px; font-size: 0.76rem; }
   </style>
 </head>
 <body>
@@ -167,17 +195,21 @@
           <thead>
             <tr>
               <th style="width:36px;">#</th>
-              <th style="width:150px;">Page Name</th>
+              <th style="width:140px;">Page Name</th>
               <th>URL</th>
-              <th style="width:165px;">Suggested Platform</th>
-              <th style="width:90px;">Confidence</th>
-              <th>Reason</th>
+              <th style="width:170px;">Suggested Platform</th>
+              <th style="width:135px;">Treatment</th>
+              <th style="width:112px;">Priority</th>
+              <th style="width:80px;">Confidence</th>
+              <th style="width:78px;" title="Accuracy · Clarity · Structure · Actionability · User Focus · Sustainability">Health</th>
+              <th style="width:74px;"></th>
             </tr>
           </thead>
           <tbody id="suggest-tbody"></tbody>
         </table>
       </div>
       <div class="actions">
+        <button class="btn-detail hidden" id="toggle-all-details-btn" onclick="toggleAllDetails()">▸ Expand all details</button>
         <button class="btn-suggest-export hidden" id="suggest-export-btn" onclick="exportSuggestions()">📥 Export Suggestions Excel</button>
         <button class="btn-cancel hidden" id="cancel-analysis-btn" onclick="cancelJob('analysis')">Cancel</button>
       </div>
@@ -475,14 +507,133 @@
     };
     const CONF_CLASS = { "High": "conf-high", "Medium": "conf-medium", "Low": "conf-low" };
 
+    const TREATMENT_CHIP = {
+      "ARCHIVE / REMOVE REVIEW": "chip chip-archive",
+      "EXPERT REVIEW NEEDED":    "chip chip-expert",
+    };
+    const PRIORITY_CLASS = {
+      "Priority 1 - Act Now":                "prio-1",
+      "Priority 2 - Important Improvement":  "prio-2",
+      "Priority 3 - Strategic Opportunity":  "prio-3",
+      "Priority 4 - Maintain/Monitor":       "prio-4",
+    };
+    // Abbreviated for the table; the full wording stays in the tooltip and Excel.
+    const PRIORITY_SHORT = {
+      "Priority 1 - Act Now":                "P1 · Act Now",
+      "Priority 2 - Important Improvement":  "P2 · Important",
+      "Priority 3 - Strategic Opportunity":  "P3 · Strategic",
+      "Priority 4 - Maintain/Monitor":       "P4 · Monitor",
+    };
+    const HEALTH_DOT = {
+      "Strong": "hd-strong", "Acceptable": "hd-ok", "Needs Improvement": "hd-needs",
+      "Significant Concern": "hd-concern", "Unable to Determine": "hd-unknown",
+    };
+    const HEALTH_FIELDS = [
+      ["health_accuracy_currency",     "Accuracy & Currency"],
+      ["health_clarity",               "Clarity"],
+      ["health_scanability_structure", "Structure & Scanability"],
+      ["health_actionability",         "Actionability"],
+      ["health_user_focus",            "User Focus"],
+      ["health_sustainability",        "Sustainability"],
+    ];
+
+    function esc(s) {
+      return String(s == null ? '' : s).replace(/[&<>"']/g,
+        c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    }
+
+    // Six dots — one per content-health dimension, worst issues visible at a glance.
+    function healthDotsHtml(r) {
+      return '<span class="health-dots">' + HEALTH_FIELDS.map(([key, label]) =>
+        `<span class="health-dot ${HEALTH_DOT[r[key]] || 'hd-unknown'}" title="${esc(label)}: ${esc(r[key] || 'Unable to Determine')}"></span>`
+      ).join('') + '</span>';
+    }
+
+    function detailBlock(title, body) {
+      if (!body) return '';
+      return `<div class="detail-block"><h4>${esc(title)}</h4>${body}</div>`;
+    }
+
+    function textBlock(title, value) {
+      return value ? detailBlock(title, esc(value)) : '';
+    }
+
+    function listBlock(title, values) {
+      if (!Array.isArray(values) || !values.length) return '';
+      return detailBlock(title, '<ul>' + values.map(v => `<li>${esc(v)}</li>`).join('') + '</ul>');
+    }
+
+    function detailHtml(r) {
+      const healthRows = HEALTH_FIELDS.map(([key, label]) =>
+        `<span class="health-dot ${HEALTH_DOT[r[key]] || 'hd-unknown'}" style="margin-top:4px"></span>` +
+        `<span>${esc(label)}: <strong>${esc(r[key] || 'Unable to Determine')}</strong></span>`
+      ).join('');
+
+      const audience = [
+        r.primary_audience ? `Primary: <strong>${esc(r.primary_audience)}</strong>` : '',
+        r.secondary_audience && r.secondary_audience !== 'Not applicable'
+          ? `Secondary: ${esc(r.secondary_audience)}` : '',
+        r.primary_user_need ? `Need: <strong>${esc(r.primary_user_need)}</strong>` : '',
+        r.content_purpose ? `Purpose: ${esc(r.content_purpose)}` : '',
+      ].filter(Boolean).join('<br>');
+
+      const dup = r.duplication_status
+        ? esc(r.duplication_status) + (Array.isArray(r.related_urls) && r.related_urls.length
+            ? '<ul>' + r.related_urls.map(u => `<li>${esc(u)}</li>`).join('') + '</ul>' : '')
+        : '';
+
+      return `<div class="detail-grid">
+        ${textBlock('Page summary', r.page_summary)}
+        ${detailBlock('Audience & need', audience)}
+        ${textBlock('Why this purpose', r.purpose_explanation)}
+        ${detailBlock('Content health', `<div class="detail-health">${healthRows}</div>`)}
+        ${textBlock('Health notes', r.health_notes)}
+        ${textBlock('Major issues', r.major_issues)}
+        ${detailBlock('Duplication', dup)}
+        ${listBlock('Improvement opportunities', r.improvement_opportunities)}
+        ${textBlock('AI / search readiness', r.ai_search_readiness)}
+        ${textBlock('Key recommendation', r.key_recommendation)}
+        ${listBlock('Questions for content owner', r.content_owner_questions)}
+        ${textBlock('What would raise confidence', r.confidence_gap)}
+      </div>`;
+    }
+
+    function renderDetail(index) {
+      const r  = suggestionResults.find(x => x.index === index);
+      const td = document.querySelector(`#detail-${index} td`);
+      if (r && td) td.innerHTML = detailHtml(r);
+    }
+
+    function toggleDetail(index) {
+      const row = document.getElementById(`detail-${index}`);
+      const btn = document.querySelector(`#row-${index} .btn-detail`);
+      if (!row) return;
+      const hidden = row.classList.toggle('hidden');
+      if (btn) btn.textContent = hidden ? '▸ Details' : '▾ Hide';
+      if (!hidden) renderDetail(index);
+    }
+
+    function toggleAllDetails() {
+      const btn = document.getElementById('toggle-all-details-btn');
+      const expand = btn.textContent.startsWith('▸');
+      document.querySelectorAll('.detail-row').forEach(row => {
+        const index = Number(row.id.replace('detail-', ''));
+        const isHidden = row.classList.contains('hidden');
+        if (expand === isHidden) toggleDetail(index);
+      });
+      btn.textContent = expand ? '▾ Collapse all details' : '▸ Expand all details';
+    }
+
     async function analyzeLinks() {
       if (!scrapedLinks.length) { alert('Scrape some links first.'); return; }
       const n = scrapedLinks.length;
-      const estimatedLow = (n * 0.0025).toFixed(2);
-      const estimatedHigh = (n * 0.0035).toFixed(2);
+      const estimatedLow = (n * 0.005).toFixed(2);
+      const estimatedHigh = (n * 0.008).toFixed(2);
       if (!confirm(
         `Analyze ${n} page${n !== 1 ? 's' : ''} with AI?\n\n` +
-        `Each page's content is read and classified by Claude using the Content Management Guide.\n` +
+        `Each page is read and given a full content analysis by Claude — platform fit, audience, ` +
+        `content health, recommended treatment and priority — using the Content Management Guide ` +
+        `and the AI Content Analysis framework.\n` +
         `Conservative estimate: ~$${estimatedLow}–$${estimatedHigh} total. Actual cost can vary by page length and cache hits.`
       )) return;
 
@@ -494,6 +645,9 @@
       document.getElementById('suggest-bar-wrap').classList.remove('hidden');
       document.getElementById('suggest-status').textContent = 'Loading pages…';
       document.getElementById('suggest-export-btn').classList.add('hidden');
+      const toggleAllBtn = document.getElementById('toggle-all-details-btn');
+      toggleAllBtn.classList.add('hidden');
+      toggleAllBtn.textContent = '▸ Expand all details';
       switchTab('suggest');
       try {
         const res = await fetch(`${API_BASE}/analyze-platforms`, {
@@ -535,12 +689,21 @@
           tr.id = `row-${evt.index}`;
           tr.innerHTML = `
             <td style="text-align:center">${evt.index}</td>
-            <td class="cell-name">${evt.page_name}</td>
-            <td style="font-size:0.74rem;color:#6b7280;">${evt.url}</td>
+            <td class="cell-name">${esc(evt.page_name)}</td>
+            <td style="font-size:0.74rem;color:#6b7280;">${esc(evt.url)}</td>
             <td class="cell-platform"><span class="chip chip-pending">⏳ Analyzing…</span></td>
+            <td class="cell-treatment" style="color:#9ca3af;">—</td>
+            <td class="cell-priority" style="color:#9ca3af;">—</td>
             <td class="cell-confidence" style="text-align:center;color:#9ca3af;">—</td>
-            <td class="cell-reason" style="color:#9ca3af;">Reading page content…</td>`;
+            <td class="cell-health" style="text-align:center;color:#9ca3af;">—</td>
+            <td style="text-align:center;"></td>`;
           tbody.appendChild(tr);
+
+          const detail = document.createElement('tr');
+          detail.id = `detail-${evt.index}`;
+          detail.className = 'detail-row hidden';
+          detail.innerHTML = `<td colspan="9"></td>`;
+          tbody.appendChild(detail);
         }
 
         // ── AI batch started ──────────────────────────────────────────────────
@@ -555,11 +718,7 @@
           status.innerHTML = `⚡ <strong>AI analysis</strong> — ${evt.done} of ${evt.total} done…`;
 
           const stored = suggestionResults.find(r => r.index === evt.index);
-          if (stored) {
-            stored.platform = evt.platform; stored.confidence = evt.confidence;
-            stored.reason = evt.reason; stored.tier = 2;
-            if (evt.page_name) stored.page_name = evt.page_name;
-          }
+          if (stored) Object.assign(stored, evt, { tier: 2 });
 
           const tr = document.getElementById(`row-${evt.index}`);
           if (tr) {
@@ -571,14 +730,35 @@
               ? ` <span style="font-size:0.68rem;background:#e0e7ff;color:#3730a3;padding:1px 5px;border-radius:4px;font-weight:700;">cached</span>`
               : ` <span style="font-size:0.68rem;background:#fef9c3;color:#854d0e;padding:1px 5px;border-radius:4px;font-weight:700;">⚡ AI</span>`;
             tr.querySelector('.cell-platform').innerHTML =
-              `<span class="${PLATFORM_CHIP[evt.platform] || 'chip chip-nofit'}">${evt.platform}</span>` + badge;
+              `<span class="${PLATFORM_CHIP[evt.platform] || 'chip chip-nofit'}">${esc(evt.platform)}</span>` + badge;
+
+            const treatCell = tr.querySelector('.cell-treatment');
+            treatCell.style.color = '';
+            treatCell.innerHTML = evt.recommended_treatment
+              ? `<span class="${TREATMENT_CHIP[evt.recommended_treatment] || 'chip chip-treatment'}">${esc(evt.recommended_treatment)}</span>`
+              : '—';
+
+            const prioCell = tr.querySelector('.cell-priority');
+            prioCell.style.color = '';
+            prioCell.className = `cell-priority ${PRIORITY_CLASS[evt.priority] || ''}`;
+            prioCell.textContent = PRIORITY_SHORT[evt.priority] || '—';
+            prioCell.title = evt.priority || '';
+
             const confCell = tr.querySelector('.cell-confidence');
             confCell.className = `cell-confidence ${CONF_CLASS[evt.confidence] || ''}`;
             confCell.style.textAlign = 'center';
             confCell.textContent = evt.confidence;
-            const reasonCell = tr.querySelector('.cell-reason');
-            reasonCell.style.color = '#374151';
-            reasonCell.textContent = evt.reason;
+
+            const healthCell = tr.querySelector('.cell-health');
+            healthCell.style.color = '';
+            healthCell.innerHTML = healthDotsHtml(evt);
+
+            const toggleCell = tr.lastElementChild;
+            toggleCell.innerHTML = `<button class="btn-detail" onclick="toggleDetail(${evt.index})">▸ Details</button>`;
+
+            const detail = document.getElementById(`detail-${evt.index}`);
+            if (detail && !detail.classList.contains('hidden')) renderDetail(evt.index);
+
             tr.style.transition = 'background .1s';
             tr.style.background = '#fef9c3';
             setTimeout(() => { tr.style.background = ''; }, 1000);
@@ -600,9 +780,12 @@
             const confCell = tr.querySelector('.cell-confidence');
             confCell.className = 'cell-confidence conf-low';
             confCell.style.textAlign = 'center'; confCell.textContent = 'Low';
-            const reasonCell = tr.querySelector('.cell-reason');
-            reasonCell.style.color = '#b91c1c';
-            reasonCell.textContent = 'Could not analyze: ' + evt.reason;
+            const treatCell = tr.querySelector('.cell-treatment');
+            treatCell.style.color = '#b91c1c';
+            treatCell.textContent = 'Could not analyze';
+            treatCell.title = evt.reason || '';
+            tr.querySelector('.cell-priority').textContent = '—';
+            tr.querySelector('.cell-health').textContent = '—';
           }
         }
 
@@ -626,6 +809,7 @@
             ? `✓ Done — ${ok} of ${evt.total} classified (${failed} failed)`
             : `✓ Done — ${evt.total} pages classified by AI`;
           document.getElementById('suggest-export-btn').classList.remove('hidden');
+          document.getElementById('toggle-all-details-btn').classList.remove('hidden');
           resetAnalyzeBtn();
           finishJob('analysis');
         }

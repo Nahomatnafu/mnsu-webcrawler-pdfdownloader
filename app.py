@@ -24,7 +24,11 @@ from openpyxl.utils import get_column_letter
 from flask import Flask, Response, jsonify, render_template, request, send_file
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 from playwright.async_api import async_playwright
-from classifier import normalize_platform, clamp_platform
+from classifier import (
+    HEALTH_DIMENSIONS,
+    clamp_analysis_fields,
+    default_analysis_fields,
+)
 
 load_dotenv()
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
@@ -59,11 +63,38 @@ def guide_version() -> str:
         return "noguide"
 
 
-# Fixed instructions; the large, stable guide block is appended and prompt-cached.
-TIER2_INSTRUCTIONS = """You are a content strategist at Minnesota State University, Mankato (MNSU).
-Your job: read a university web page's content and decide which single MNSU content platform it should live on, based STRICTLY on the official Content Management Guide provided below.
+# ── AI Content Analysis framework → cached Claude system prompt ────────────────
+# Injected whole rather than sliced: its batch-level sections (17-18) are a small
+# fraction of the file, and TIER2_INSTRUCTIONS tells the model to skip them.
+FRAMEWORK_PATH = Path("AI_Content_Analysis_Direction_Support.md")
 
-You will receive a page's title, URL, and a content excerpt. Judge by the actual content and its primary audience and purpose — NOT by the URL structure. A page sitting under a public-facing section can still belong on another platform.
+
+def load_ai_analysis_framework() -> str:
+    """Load the AI content-analysis framework verbatim."""
+    try:
+        return FRAMEWORK_PATH.read_text(encoding="utf-8").strip()
+    except Exception:
+        return ""
+
+
+def framework_version() -> str:
+    """Short hash of the framework file, used to invalidate cached suggestions on edit."""
+    try:
+        return hashlib.md5(FRAMEWORK_PATH.read_bytes()).hexdigest()[:8]
+    except Exception:
+        return "noframework"
+
+
+# Fixed instructions; the guide and framework blocks are appended and prompt-cached.
+TIER2_INSTRUCTIONS = """You are a content strategist and content-UX analyst at Minnesota State University, Mankato (MNSU).
+
+Your job: read ONE university web page — given its title, URL, and a content excerpt — and produce a complete, structured analysis of that single page. Two source documents follow below: the official Content Management Guide (platform definitions) and the AI Content Analysis & Platform Recommendation Framework (how to evaluate a page). Base every judgment strictly on those two documents, not on general web-content-strategy knowledge.
+
+You are evaluating pages ONE AT A TIME. The framework document's sections 17 (Cross-Site Analysis) and 18 (Project Plan Generation) describe a SEPARATE, batch-level step that runs after every page in a crawl has been analyzed — they are not part of this task. Ignore them; do not attempt cross-page comparisons beyond what the current excerpt tells you.
+
+Judge by the actual content and its primary audience and purpose — NOT by the URL structure. A page sitting under a public-facing section can still belong on another platform.
+
+═══ PLATFORM RECOMMENDATION ═══
 
 VALID PLATFORMS (respond with one of these EXACT names):
 - Website
@@ -73,7 +104,7 @@ VALID PLATFORMS (respond with one of these EXACT names):
 - Teams / SharePoint
 - No Clear Fit
 
-DECISION GUIDANCE (always defer to the guide below):
+DECISION GUIDANCE (always defer to the Content Management Guide below):
 - Policies, conduct codes, required procedures, forms, FAQs, and step-by-step task instructions → Maverick OneStop, even under a public URL like /housing/policies/.
 - Purely informational or marketing pages for prospective students, families, or the general public → Website.
 - Content exclusively for employees (not students) → The Fountain.
@@ -81,26 +112,101 @@ DECISION GUIDANCE (always defer to the guide below):
 - Internal department/committee collaboration material → Teams / SharePoint.
 - If nothing genuinely fits, use "No Clear Fit".
 
+Every page you see currently lives on the public Website — that is where it was crawled from. Only name a DIFFERENT platform when the content genuinely belongs elsewhere.
+
+═══ FULL PAGE ANALYSIS ═══
+
+1. USER NEED — primary: Explore | Understand | Act | Connect. Secondary: the same four, or "Not applicable".
+2. AUDIENCE — primary: Prospective students | Current students | Families/supporters | Faculty | Staff | Alumni | Community/public | Multiple audiences | Unable to determine. Secondary: the same nine, or "Not applicable".
+3. CONTENT PURPOSE — one of: Recruitment | Awareness | General information | Service information | Process guidance | Transaction support | Policy or requirement | Academic information | Event or engagement | News or announcement | Contact/support | Resource collection | Reference information | Other. Add one short sentence explaining it.
+4. CONTENT HEALTH — rate EACH of six dimensions independently as Strong | Acceptable | Needs Improvement | Significant Concern | Unable to Determine:
+   - Accuracy and Currency (outdated dates, expired deadlines, stale terminology — do NOT flag evergreen content merely for lacking a date)
+   - Clarity (dense text, jargon, unclear instructions)
+   - Scanability and Structure (headings, lists, logical sectioning)
+   - Actionability (clear next steps, calls to action, contact options)
+   - User Focus (organized around user needs vs. internal department structure)
+   - Sustainability (manually-repeated info that will rot vs. content easy to keep current)
+   For every dimension rated Needs Improvement or Significant Concern, add one short clause to "health_notes" naming the dimension and the specific issue (e.g. "Clarity: the reporting steps are one dense paragraph."). Combine all clauses into a single string; use "" if none apply.
+5. DUPLICATION — one of: No significant duplication found | Possible overlap | Significant overlap | Likely duplicate | Conflicting content detected. Put up to 5 related URLs in "related_urls" ONLY with genuine evidence from the excerpt; otherwise [].
+6. AI/SEARCH READINESS — how well this page would serve as a source for AI-assisted answers (e.g. MNSU's "Ask Stomper"). Rate on the same five-value scale as content health.
+7. RECOMMENDED TREATMENT — exactly one of: KEEP | KEEP + IMPROVE | CONSOLIDATE | CONNECT | CONSIDER MOVING | REPLACE WITH ACTION | ARCHIVE / REMOVE REVIEW | EXPERT REVIEW NEEDED.
+8. IMPROVEMENT OPPORTUNITIES — up to 5 from: Update outdated information, Verify accuracy, Clarify primary audience, Clarify page purpose, Rewrite for clarity, Reduce jargon, Improve headings, Improve page title, Improve scanability, Add clear next step, Improve call to action, Clarify eligibility, Clarify deadlines, Improve contact/support information, Consolidate duplicate content, Establish authoritative source, Remove redundant information, Link rather than duplicate, Improve platform fit, Improve AI/search readability, Separate multiple audiences, Improve user journey, Review for removal — or just "No significant improvement identified".
+9. PRIORITY — one of: "Priority 1 - Act Now" | "Priority 2 - Important Improvement" | "Priority 3 - Strategic Opportunity" | "Priority 4 - Maintain/Monitor".
+10. SUMMARY FIELDS — "page_summary" (1-2 sentences on what the page provides), "major_issues" (1-2 sentences on the most important strength or concern), "key_recommendation" (one sentence on what should happen), "content_owner_questions" (up to 3 questions genuinely needing a human answer, else []).
+
 CONFIDENCE CALIBRATION — be honest, never manufacture confidence:
-- High: The content unambiguously fits ONE platform; an expert would agree instantly with no reasonable alternative.
-- Medium: One platform is the best fit, but a defensible argument exists for one alternative.
-- Low: Multiple platforms are genuinely defensible, or the excerpt is too thin to tell. Use this freely.
+- High: The content unambiguously fits ONE platform and treatment; an expert would agree instantly.
+- Medium: One answer is best, but a defensible alternative exists, or institutional context is missing.
+- Low: Multiple answers are genuinely defensible, or the excerpt is too thin. Use this freely.
+When confidence is not High, state in "confidence_gap" what additional information would raise it; use "" when it is High.
 
-Respond with a single raw JSON object — no markdown, no code fences, no extra text:
-{"platform": "<exact platform name>", "confidence": "High|Medium|Low", "reason": "<one concise sentence grounded in the guide>"}
+GUARDRAILS — you must NOT:
+- Assume every page needs to change. KEEP is a valid, common outcome.
+- Treat short content as automatically good, or long content as automatically bad.
+- Invent traffic, search volume, user behavior, conversion rates, ownership, institutional requirements, analytics, or business rules. Say "Unable to Determine" instead.
+- Recommend or imply automatic deletion. ARCHIVE / REMOVE REVIEW always means "flag for human review".
+- Treat Ask Stomper (or any AI assistant) as a content destination.
+- Reinterpret policy language in a way that changes its legal or compliance meaning. Comment on the clarity and structure of policy content, not its substance.
 
---- OFFICIAL CONTENT MANAGEMENT GUIDE (SOURCE OF TRUTH) ---
+RESPONSE FORMAT — a single raw JSON object, no markdown, no code fences, no text before or after. Always include EVERY key below, using these exact names. Use the literal defaults ("Not applicable", "", []) when a field genuinely does not apply — never omit a key:
+
+{
+  "platform": "<one of the 6 valid platforms>",
+  "confidence": "High|Medium|Low",
+  "reason": "<one concise sentence grounding the platform choice in the guide>",
+  "page_summary": "<1-2 sentences>",
+  "primary_user_need": "Explore|Understand|Act|Connect",
+  "secondary_user_need": "Explore|Understand|Act|Connect|Not applicable",
+  "primary_audience": "<one of the 9 audience values>",
+  "secondary_audience": "<one of the 9 audience values, or Not applicable>",
+  "content_purpose": "<one of the 14 purpose values>",
+  "purpose_explanation": "<short sentence>",
+  "health_accuracy_currency": "Strong|Acceptable|Needs Improvement|Significant Concern|Unable to Determine",
+  "health_clarity": "Strong|Acceptable|Needs Improvement|Significant Concern|Unable to Determine",
+  "health_scanability_structure": "Strong|Acceptable|Needs Improvement|Significant Concern|Unable to Determine",
+  "health_actionability": "Strong|Acceptable|Needs Improvement|Significant Concern|Unable to Determine",
+  "health_user_focus": "Strong|Acceptable|Needs Improvement|Significant Concern|Unable to Determine",
+  "health_sustainability": "Strong|Acceptable|Needs Improvement|Significant Concern|Unable to Determine",
+  "health_notes": "<combined dimension: issue clauses, or empty string>",
+  "duplication_status": "<one of the 5 duplication values>",
+  "related_urls": ["<up to 5 URLs>"],
+  "ai_search_readiness": "Strong|Acceptable|Needs Improvement|Significant Concern|Unable to Determine",
+  "recommended_treatment": "<one of the 8 treatment values>",
+  "improvement_opportunities": ["<up to 5 improvement values>"],
+  "priority": "Priority 1 - Act Now|Priority 2 - Important Improvement|Priority 3 - Strategic Opportunity|Priority 4 - Maintain/Monitor",
+  "confidence_gap": "<what would raise confidence, or empty string>",
+  "major_issues": "<1-2 sentences>",
+  "key_recommendation": "<one sentence>",
+  "content_owner_questions": ["<up to 3 short questions, or empty list>"]
+}
+
+--- OFFICIAL CONTENT MANAGEMENT GUIDE (SOURCE OF TRUTH FOR PLATFORM DEFINITIONS) ---
 """
 
 PLATFORM_GUIDE = load_platform_guide()
 GUIDE_VERSION = guide_version()
+AI_ANALYSIS_FRAMEWORK = load_ai_analysis_framework()
+FRAMEWORK_VERSION = framework_version()
 
-# Anthropic prompt-caching: the large, constant guide block is marked ephemeral
-# so it is cached across the whole batch, cutting input cost/latency dramatically.
+FRAMEWORK_BLOCK_TEXT = (
+    "--- AI CONTENT ANALYSIS & PLATFORM RECOMMENDATION FRAMEWORK "
+    "(SOURCE OF TRUTH FOR THE ANALYSIS DIMENSIONS ABOVE; IGNORE ITS SECTIONS "
+    "17-18, THOSE ARE A SEPARATE BATCH-LEVEL STEP) ---\n\n" + AI_ANALYSIS_FRAMEWORK
+)
+
+# Anthropic prompt-caching: the marker sits on the LAST block so the whole
+# constant prefix (instructions + guide + framework) is cached as one unit
+# across the batch, cutting input cost and latency.
 TIER2_SYSTEM_BLOCKS = [
     {"type": "text", "text": TIER2_INSTRUCTIONS},
-    {"type": "text", "text": PLATFORM_GUIDE, "cache_control": {"type": "ephemeral"}},
+    {"type": "text", "text": PLATFORM_GUIDE},
+    {"type": "text", "text": FRAMEWORK_BLOCK_TEXT, "cache_control": {"type": "ephemeral"}},
 ]
+
+# Bump when TIER2_INSTRUCTIONS or the response schema changes, so cached results
+# in the old shape can never be served as if they were current.
+SUGGESTION_SCHEMA_VERSION = "2"
+SUGGEST_CACHE_VERSION = f"{GUIDE_VERSION}-{FRAMEWORK_VERSION}-{SUGGESTION_SCHEMA_VERSION}"
 
 # Concurrency + model settings for the AI analysis pipeline.
 # ANALYSIS_CONCURRENCY caps how many pages are fetched + classified at once.
@@ -133,6 +239,10 @@ def env_int(name: str, default: int, minimum: int | None = None) -> int:
 
 
 ANALYSIS_CONCURRENCY = env_int("ANALYSIS_CONCURRENCY", 2, 1)
+
+# Response budget for one page's analysis JSON.  Worst-case realistic output is
+# ~800 tokens; the headroom guards against truncated (unparseable) responses.
+TIER2_MAX_TOKENS = env_int("TIER2_MAX_TOKENS", 2048, 256)
 
 # Restart the shared Chromium browser every N page loads.  A single long-lived
 # context accumulates memory across thousands of navigations, which is what
@@ -804,10 +914,8 @@ def export_excel(links: list[dict], start_url: str) -> Path:
         scraped  = link.get("scraped_at") or ""
         size_kb  = link.get("size_kb") or ""
 
-        # Derive page name and folder path from the URL
-        segments = [s for s in urlparse(url).path.strip("/").split("/") if s]
-        page_name   = segments[-1].replace("-", " ").title() if segments else "Home"
-        folder_path = "/".join(segments[:-1]) if len(segments) > 1 else "/"
+        page_name   = url_page_name(url)
+        folder_path = url_parent_section(url)
 
         row_fill = done_fill if done else pending_fill
         row = [i, page_name, url, folder_path, file, "✓ Yes" if done else "✗ No", scraped, size_kb]
@@ -855,8 +963,8 @@ def export_excel(links: list[dict], start_url: str) -> Path:
 # ── Suggestion result cache (keyed by URL + guide version) ─────────────────────
 
 def _suggest_cache_path(url: str) -> Path:
-    """Cache file for an AI suggestion, invalidated automatically when the guide changes."""
-    key = hashlib.md5(f"{url}|{GUIDE_VERSION}".encode()).hexdigest()[:12]
+    """Cache file for an AI suggestion, invalidated when either source doc or the schema changes."""
+    key = hashlib.md5(f"{url}|{SUGGEST_CACHE_VERSION}".encode()).hexdigest()[:12]
     SUGGEST_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     return SUGGEST_CACHE_DIR / f"{key}.json"
 
@@ -878,6 +986,60 @@ def _save_suggest_cache(url: str, data: dict) -> None:
         pass
 
 
+def url_page_name(url: str) -> str:
+    """Human-readable page name derived from the last URL path segment."""
+    segments = [s for s in urlparse(url).path.strip("/").split("/") if s]
+    return segments[-1].replace("-", " ").title() if segments else "Home"
+
+
+def url_parent_section(url: str) -> str:
+    """Parent folder path derived from all but the last URL path segment."""
+    segments = [s for s in urlparse(url).path.strip("/").split("/") if s]
+    return "/".join(segments[:-1]) if len(segments) > 1 else "/"
+
+
+# Worst rating across the six health dimensions wins the overall rating.
+_HEALTH_SEVERITY = {
+    "Strong": 1,
+    "Acceptable": 2,
+    "Needs Improvement": 3,
+    "Significant Concern": 4,
+}
+_HEALTH_BY_SEVERITY = {v: k for k, v in _HEALTH_SEVERITY.items()}
+
+_TREATMENT_FIT = {
+    "KEEP": "Appropriate",
+    "KEEP + IMPROVE": "Appropriate",
+    "CONNECT": "Appropriate",
+    "EXPERT REVIEW NEEDED": "Needs Expert Review",
+}
+
+
+def derive_computed_fields(url: str, fields: dict) -> dict:
+    """
+    Fields computed from the URL and the AI's own answers — no AI call needed.
+
+    "Current Platform" is always the public Website because that is where every
+    crawled page already lives.
+    """
+    treatment = fields.get("recommended_treatment", "")
+    fit = _TREATMENT_FIT.get(treatment, "Reconsider" if treatment else "Unable to Determine")
+    scored = [
+        _HEALTH_SEVERITY[fields[dim]]
+        for dim in HEALTH_DIMENSIONS
+        if fields.get(dim) in _HEALTH_SEVERITY
+    ]
+    overall = _HEALTH_BY_SEVERITY[max(scored)] if scored else "Unable to Determine"
+    return {
+        "parent_section": url_parent_section(url),
+        "current_platform": "Website",
+        "current_platform_fit": fit,
+        "overall_content_health": overall,
+        "outdated_content_flag": fields.get("health_accuracy_currency") in ("Needs Improvement", "Significant Concern"),
+        "conflicting_content_flag": fields.get("duplication_status") == "Conflicting content detected",
+    }
+
+
 def is_credit_error(exc: Exception) -> bool:
     text = str(exc).lower()
     return any(marker in text for marker in AI_CREDIT_ERROR_MARKERS)
@@ -895,24 +1057,36 @@ def parse_ai_json(raw: str) -> dict:
 
 
 def fallback_platform_suggestion(page_name: str, url: str, excerpt: str) -> dict:
+    """
+    Keyword-only guess used when the AI call fails after retries.
+
+    Built on default_analysis_fields() so a fallback result carries the same keys
+    as a real one — downstream code never has to special-case it.
+    """
     text = f"{page_name} {url} {excerpt}".lower()
     if any(word in text for word in ("policy", "policies", "procedure", "form", "report", "complaint", "tobacco", "smoking", "violation")):
-        return {
+        guess = {
             "platform": "Maverick OneStop",
             "confidence": "Medium",
             "reason": "Fallback rule: policy, reporting, form, or procedure content usually belongs in Maverick OneStop.",
         }
-    if any(word in text for word in ("student organization", "club", "homecoming", "activities", "mavlife")):
-        return {
+    elif any(word in text for word in ("student organization", "club", "homecoming", "activities", "mavlife")):
+        guess = {
             "platform": "MavLife / Student Hub",
             "confidence": "Low",
             "reason": "Fallback rule: student activity content may belong in MavLife / Student Hub.",
         }
-    return {
-        "platform": "Website",
-        "confidence": "Low",
-        "reason": "Fallback rule used because AI returned no valid classification; public-facing informational content defaults to Website.",
-    }
+    else:
+        guess = {
+            "platform": "Website",
+            "confidence": "Low",
+            "reason": "Fallback rule used because AI returned no valid classification; public-facing informational content defaults to Website.",
+        }
+    fields = default_analysis_fields()
+    fields.update(guess)
+    fields["confidence_gap"] = "Automated keyword fallback — a full AI analysis of this page is still needed."
+    fields.update(derive_computed_fields(url, fields))
+    return fields
 
 
 async def _call_claude(client, page_name: str, url: str, excerpt: str) -> dict | None:
@@ -921,7 +1095,7 @@ async def _call_claude(client, page_name: str, url: str, excerpt: str) -> dict |
         f"Page title: {page_name}\n"
         f"URL: {url}\n\n"
         f"Content excerpt:\n{excerpt}\n\n"
-        "Classify this page into the single best MNSU platform per the guide. "
+        "Analyze this page per the guide and the framework, and return the full JSON object. "
         "If the content is ambiguous or too thin to tell, use Low confidence."
     )
     last_error = "AI classification failed"
@@ -929,7 +1103,7 @@ async def _call_claude(client, page_name: str, url: str, excerpt: str) -> dict |
         try:
             resp = await client.messages.create(
                 model=TIER2_MODEL,
-                max_tokens=256,
+                max_tokens=TIER2_MAX_TOKENS,
                 system=TIER2_SYSTEM_BLOCKS,
                 messages=[{"role": "user", "content": user_msg}],
             )
@@ -941,13 +1115,9 @@ async def _call_claude(client, page_name: str, url: str, excerpt: str) -> dict |
             continue
         try:
             raw = resp.content[0].text.strip()
-            ai = parse_ai_json(raw)
-            platform = clamp_platform(normalize_platform(ai.get("platform", "")))
-            confidence = ai.get("confidence", "Low")
-            if confidence not in ("High", "Medium", "Low"):
-                confidence = "Low"
-            reason = (ai.get("reason") or "").strip() or "No reason provided."
-            return {"platform": platform, "confidence": confidence, "reason": reason}
+            fields = clamp_analysis_fields(parse_ai_json(raw))
+            fields.update(derive_computed_fields(url, fields))
+            return fields
         except Exception as e:
             last_error = str(e)
             await asyncio.sleep(0.5 * (attempt + 1))
@@ -971,18 +1141,24 @@ async def _run_ai_analysis(job_id: str, results: list[dict], by_index: dict[int,
     done = 0
 
     def _emit(res: dict) -> None:
-        """Stream one finished result (success or error) to the SSE queue."""
+        """
+        Stream one finished result (success or error) to the SSE queue.
+
+        The whole result dict is spread into both the stored row and the SSE
+        payload so new analysis fields flow through without being enumerated here.
+        """
         idx = res["index"]
+        stored = by_index[idx]
         if res.get("error"):
+            stored.update(default_analysis_fields())
+            stored.update(reason=res["error"], tier=0)
             q.put({"type": "analysis_error", "index": idx, "reason": res["error"],
                    "done": done, "total": total})
             return
-        stored = by_index[idx]
-        stored.update(page_name=res["page_name"], platform=res["platform"],
-                      confidence=res["confidence"], reason=res["reason"], tier=2)
-        q.put({"type": "analysis_upgrade", "index": idx, "page_name": res["page_name"],
-               "platform": res["platform"], "confidence": res["confidence"],
-               "reason": res["reason"], "cached": res.get("cached", False),
+        payload = {k: v for k, v in res.items() if k != "error"}
+        stored.update(**payload, tier=2)
+        q.put({"type": "analysis_upgrade", **payload,
+               "cached": res.get("cached", False),
                "done": done, "total": total})
 
     # ── 1. Serve cached results instantly (no browser involved) ───────────────
@@ -1086,13 +1262,12 @@ def _analysis_worker(job_id: str, links: list[dict], q: queue.Queue) -> None:
                 emit_terminal(q, job_id, {"type": "cancelled", "reason": "Analysis cancelled."})
                 return
             url = link.get("url", "")
-            segments = [s for s in urlparse(url).path.strip("/").split("/") if s]
-            page_name = segments[-1].replace("-", " ").title() if segments else "Home"
             result = {
+                **default_analysis_fields(),
                 "index":      i,
                 "total":      total,
                 "url":        url,
-                "page_name":  page_name,
+                "page_name":  url_page_name(url),
                 "platform":   "Analyzing…",
                 "confidence": "—",
                 "reason":     "Reading page content…",
@@ -1147,32 +1322,89 @@ def export_suggestions(results: list[dict], start_url: str) -> Path:
     }
     CONFIDENCE_COLORS = {"High": "16A34A", "Medium": "D97706", "Low": "DC2626"}
 
-    headers = ["#", "Page Name", "Full URL", "Suggested Platform", "Confidence", "Reason", "Reviewer Override"]
-    for col, h in enumerate(headers, 1):
-        cell = ws.cell(row=1, column=col, value=h)
+    def _yes_no(value) -> str:
+        return "Yes" if value else "No"
+
+    def _joined(value) -> str:
+        return "; ".join(value) if isinstance(value, list) else (value or "")
+
+    # (header, value getter, column width, wrap text).  Grouped per the analysis
+    # framework's suggested spreadsheet output.  Trailing owner/status columns
+    # ship blank for the content team to fill in.
+    COLUMNS = [
+        # Content identification
+        ("#",                             lambda r: r["index"],                              5,  False),
+        ("Page Name",                     lambda r: r.get("page_name", ""),                  28, False),
+        ("Full URL",                      lambda r: r.get("url", ""),                        50, True),
+        ("Parent Section",                lambda r: r.get("parent_section", ""),             30, True),
+        ("Current Platform",              lambda r: r.get("current_platform", "Website"),    18, False),
+        ("Page Summary",                  lambda r: r.get("page_summary", ""),               50, True),
+        # Audience and purpose
+        ("Primary Audience",              lambda r: r.get("primary_audience", ""),           20, False),
+        ("Secondary Audience",            lambda r: r.get("secondary_audience", ""),         20, False),
+        ("Primary User Need",             lambda r: r.get("primary_user_need", ""),          16, False),
+        ("Secondary User Need",           lambda r: r.get("secondary_user_need", ""),        16, False),
+        ("Content Purpose",               lambda r: r.get("content_purpose", ""),            22, False),
+        ("Purpose Explanation",           lambda r: r.get("purpose_explanation", ""),        40, True),
+        # Content health
+        ("Accuracy/Currency",             lambda r: r.get("health_accuracy_currency", ""),   18, False),
+        ("Clarity",                       lambda r: r.get("health_clarity", ""),             18, False),
+        ("Structure/Scanability",         lambda r: r.get("health_scanability_structure", ""), 18, False),
+        ("Actionability",                 lambda r: r.get("health_actionability", ""),       18, False),
+        ("User Focus",                    lambda r: r.get("health_user_focus", ""),          18, False),
+        ("Sustainability",                lambda r: r.get("health_sustainability", ""),      18, False),
+        ("Overall Content Health",        lambda r: r.get("overall_content_health", ""),     20, False),
+        ("Content Health Notes",          lambda r: r.get("health_notes", ""),               50, True),
+        # Content issues
+        ("Outdated Content Flag",         lambda r: _yes_no(r.get("outdated_content_flag")), 16, False),
+        ("Duplication Status",            lambda r: r.get("duplication_status", ""),         24, False),
+        ("Related/Duplicate URLs",        lambda r: _joined(r.get("related_urls")),          45, True),
+        ("Conflicting Content Flag",      lambda r: _yes_no(r.get("conflicting_content_flag")), 16, False),
+        ("Major Issues Identified",       lambda r: r.get("major_issues", ""),               50, True),
+        ("Improvement Opportunities",     lambda r: _joined(r.get("improvement_opportunities")), 45, True),
+        # Strategy
+        ("Current Platform Fit",          lambda r: r.get("current_platform_fit", ""),       18, False),
+        ("Recommended Treatment",         lambda r: r.get("recommended_treatment", ""),      22, False),
+        ("Recommended Platform",          lambda r: r.get("platform", ""),                   22, False),
+        ("Platform Rationale",            lambda r: r.get("reason", ""),                     50, True),
+        ("AI/Search Readiness",           lambda r: r.get("ai_search_readiness", ""),        18, False),
+        # Project planning
+        ("Priority",                      lambda r: r.get("priority", ""),                   24, False),
+        ("Recommendation Confidence",     lambda r: r.get("confidence", ""),                 16, False),
+        ("What Would Raise Confidence",   lambda r: r.get("confidence_gap", ""),             40, True),
+        ("Key Recommendation",            lambda r: r.get("key_recommendation", ""),         50, True),
+        ("Questions for Content Owner",   lambda r: _joined(r.get("content_owner_questions")), 45, True),
+        ("Content Owner",                 lambda r: "",                                      20, False),
+        ("Owner Decision",                lambda r: "",                                      20, False),
+        ("Owner Notes",                   lambda r: "",                                      30, True),
+        ("Status",                        lambda r: "",                                      16, False),
+    ]
+
+    for col, (header, _getter, _width, _wrap) in enumerate(COLUMNS, 1):
+        cell = ws.cell(row=1, column=col, value=header)
         cell.font = header_font
         cell.fill = header_fill
         cell.alignment = center
         cell.border = border
     ws.row_dimensions[1].height = 22
 
+    confidence_col = next(i for i, c in enumerate(COLUMNS, 1) if c[0] == "Recommendation Confidence")
+
     for r in results:
         row_num = r["index"] + 1
-        row_fill = PatternFill("solid", fgColor=PLATFORM_COLORS.get(r["platform"], "F3F4F6"))
-        conf_font = Font(color=CONFIDENCE_COLORS.get(r["confidence"], "374151"), bold=True)
-        values = [r["index"], r["page_name"], r["url"], r["platform"], r["confidence"], r["reason"], ""]
-        for col, val in enumerate(values, 1):
-            cell = ws.cell(row=row_num, column=col, value=val)
+        row_fill = PatternFill("solid", fgColor=PLATFORM_COLORS.get(r.get("platform", ""), "F3F4F6"))
+        conf_font = Font(color=CONFIDENCE_COLORS.get(r.get("confidence", ""), "374151"), bold=True)
+        for col, (_header, getter, _width, wrap_text) in enumerate(COLUMNS, 1):
+            cell = ws.cell(row=row_num, column=col, value=getter(r))
             cell.fill = row_fill
             cell.border = border
-            cell.alignment = wrap if col in (3, 6) else center
-            if col == 5:
+            cell.alignment = wrap if wrap_text else center
+            if col == confidence_col:
                 cell.font = conf_font
 
-    widths = [5, 28, 55, 22, 14, 55, 28]
-    for col, w in enumerate(widths, 1):
-        ws.column_dimensions[get_column_letter(col)].width = w
-    ws.freeze_panes = "A2"
+    for col, (_header, _getter, width, _wrap) in enumerate(COLUMNS, 1):
+        ws.column_dimensions[get_column_letter(col)].width = width
+    ws.freeze_panes = "D2"
 
     # ── Summary sheet ─────────────────────────────────────────────────────────
     ws2 = wb.create_sheet("Summary")
@@ -1196,7 +1428,19 @@ def export_suggestions(results: list[dict], start_url: str) -> Path:
         row += 1
         ws2.cell(row=row, column=1, value=conf)
         ws2.cell(row=row, column=2, value=count)
-    ws2.column_dimensions["A"].width = 28
+
+    for title, key in (("Recommended Treatment", "recommended_treatment"),
+                       ("Priority", "priority"),
+                       ("Overall Content Health", "overall_content_health")):
+        row += 2
+        ws2.cell(row=row, column=1, value=title).font = Font(bold=True)
+        ws2.cell(row=row, column=2, value="Count").font = Font(bold=True)
+        for value, count in Counter(r.get(key, "") for r in results).most_common():
+            row += 1
+            ws2.cell(row=row, column=1, value=value or "—")
+            ws2.cell(row=row, column=2, value=count)
+
+    ws2.column_dimensions["A"].width = 34
     ws2.column_dimensions["B"].width = 15
 
     out_path = OUTPUT_DIR / f"platform_suggestions_{uuid.uuid4().hex}.xlsx"
@@ -1291,9 +1535,13 @@ def progress(job_id: str):
                 analysis_results = job.get("analysis_results") or []
                 for r in analysis_results:
                     placeholder = {"type": "analysis_placeholder", **r}
-                    upgrade = {"type": "analysis_upgrade", "index": r["index"], "page_name": r.get("page_name",""), "platform": r.get("platform",""), "confidence": r.get("confidence",""), "reason": r.get("reason",""), "done": len(analysis_results), "total": len(analysis_results)}
+                    upgrade = {"type": "analysis_upgrade", **r,
+                               "done": len(analysis_results), "total": len(analysis_results)}
                     yield f"data: {json.dumps(placeholder)}\n\n"
                     yield f"data: {json.dumps(upgrade)}\n\n"
+            # The terminal event last, mirroring live ordering, so a reconnected
+            # client still runs its completion handling instead of hanging.
+            yield f"data: {json.dumps(replay)}\n\n"
             return
         while True:
             try:

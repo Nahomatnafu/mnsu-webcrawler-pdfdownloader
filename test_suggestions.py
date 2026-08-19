@@ -4,15 +4,27 @@ test_suggestions.py — unit tests for the platform-suggestion engine.
 Covers:
   - classifier.normalize_platform : folds Claude's phrasing variations to canonical names
   - classifier.clamp_platform     : validates a name against KNOWN_PLATFORMS
+  - classifier analysis clamps    : validates the full analysis-framework field set
   - app guide loader              : extracts the guide section + builds cached prompt blocks
+  - app derived fields            : URL-derived and AI-derived spreadsheet columns
+  - app export_suggestions        : Excel column layout
 
 Run:  python -m unittest test_suggestions      (or)  python test_suggestions.py
-No third-party dependencies — uses the standard-library unittest only.
 """
 
 import unittest
 
-from classifier import KNOWN_PLATFORMS, normalize_platform, clamp_platform
+from classifier import (
+    FIELD_ALLOWED_VALUES,
+    HEALTH_DIMENSIONS,
+    KNOWN_PLATFORMS,
+    clamp_analysis_fields,
+    clamp_choice,
+    clamp_multi_choice,
+    clamp_platform,
+    default_analysis_fields,
+    normalize_platform,
+)
 
 
 class TestNormalizePlatform(unittest.TestCase):
@@ -284,10 +296,204 @@ class TestGuideLoader(unittest.TestCase):
 
     def test_system_blocks_use_prompt_caching(self):
         blocks = self.app.TIER2_SYSTEM_BLOCKS
-        self.assertEqual(len(blocks), 2)
-        # The large, stable guide block must carry the ephemeral cache marker.
+        self.assertEqual(len(blocks), 3)
+        # Only the last block carries the marker, so the whole constant prefix
+        # (instructions + guide + framework) is cached as one unit.
         self.assertEqual(blocks[-1].get("cache_control"), {"type": "ephemeral"})
-        self.assertEqual(blocks[-1]["text"], self.app.PLATFORM_GUIDE)
+        self.assertNotIn("cache_control", blocks[0])
+        self.assertNotIn("cache_control", blocks[1])
+        self.assertEqual(blocks[1]["text"], self.app.PLATFORM_GUIDE)
+        self.assertIn(self.app.AI_ANALYSIS_FRAMEWORK, blocks[-1]["text"])
+
+    def test_framework_loaded_whole(self):
+        framework = self.app.AI_ANALYSIS_FRAMEWORK
+        self.assertTrue(framework, "framework document should not be empty")
+        # Whole-file load: both an early and a late section must be present.
+        self.assertIn("Identify the Primary User Need", framework)
+        self.assertIn("Decision-Making Guardrails", framework)
+
+    def test_suggest_cache_version_tracks_both_docs_and_schema(self):
+        version = self.app.SUGGEST_CACHE_VERSION
+        self.assertIn(self.app.GUIDE_VERSION, version)
+        self.assertIn(self.app.FRAMEWORK_VERSION, version)
+        self.assertTrue(version.endswith(self.app.SUGGESTION_SCHEMA_VERSION))
+        # A cache path must actually change when the schema version changes.
+        before = self.app._suggest_cache_path("https://example.edu/a/")
+        original = self.app.SUGGEST_CACHE_VERSION
+        try:
+            self.app.SUGGEST_CACHE_VERSION = original + "-changed"
+            after = self.app._suggest_cache_path("https://example.edu/a/")
+        finally:
+            self.app.SUGGEST_CACHE_VERSION = original
+        self.assertNotEqual(before.name, after.name)
+
+
+class TestAnalysisFieldClamping(unittest.TestCase):
+    def test_defaults_cover_every_known_field(self):
+        fields = default_analysis_fields()
+        for name in FIELD_ALLOWED_VALUES:
+            self.assertIn(name, fields, msg=name)
+            self.assertIn(fields[name], FIELD_ALLOWED_VALUES[name], msg=name)
+        for name in ("platform", "reason", "page_summary", "related_urls",
+                     "improvement_opportunities", "content_owner_questions"):
+            self.assertIn(name, fields, msg=name)
+
+    def test_choice_matching_is_case_insensitive(self):
+        self.assertEqual(clamp_choice("primary_user_need", "explore"), "Explore")
+        self.assertEqual(clamp_choice("recommended_treatment", "keep + improve"), "KEEP + IMPROVE")
+        self.assertEqual(clamp_choice("health_clarity", "  strong  "), "Strong")
+
+    def test_unknown_choice_falls_back_to_default(self):
+        self.assertEqual(clamp_choice("primary_user_need", "Browsing"), "Understand")
+        self.assertEqual(clamp_choice("health_clarity", None), "Unable to Determine")
+        self.assertEqual(clamp_choice("priority", 3), "Priority 4 - Maintain/Monitor")
+
+    def test_multi_choice_filters_dedupes_and_caps(self):
+        values = clamp_multi_choice("improvement_opportunities", [
+            "Improve headings", "improve headings", "Not A Real Option",
+            "Reduce jargon", "Rewrite for clarity", "Verify accuracy",
+            "Clarify deadlines", "Improve page title",
+        ])
+        self.assertEqual(len(values), 5)
+        self.assertEqual(len(set(values)), 5)
+        self.assertNotIn("Not A Real Option", values)
+
+    def test_free_text_multi_choice_keeps_arbitrary_values(self):
+        urls = clamp_multi_choice("related_urls", ["https://a.edu/", "", "https://b.edu/"])
+        self.assertEqual(urls, ["https://a.edu/", "https://b.edu/"])
+
+    def test_non_list_multi_choice_becomes_empty(self):
+        self.assertEqual(clamp_multi_choice("related_urls", "https://a.edu/"), [])
+
+    def test_full_response_is_clamped(self):
+        fields = clamp_analysis_fields({
+            "platform": "onestop",
+            "confidence": "High",
+            "reason": "  Policy content.  ",
+            "primary_user_need": "act",
+            "recommended_treatment": "consider moving",
+            "priority": "Priority 1 - Act Now",
+            "improvement_opportunities": ["Improve headings", "bogus"],
+            "related_urls": ["https://a.edu/"],
+        })
+        self.assertEqual(fields["platform"], "Maverick OneStop")
+        self.assertEqual(fields["primary_user_need"], "Act")
+        self.assertEqual(fields["recommended_treatment"], "CONSIDER MOVING")
+        self.assertEqual(fields["reason"], "Policy content.")
+        self.assertEqual(fields["improvement_opportunities"], ["Improve headings"])
+        # Fields the model omitted still come back at their defaults.
+        self.assertEqual(fields["health_clarity"], "Unable to Determine")
+
+    def test_missing_reason_gets_placeholder(self):
+        self.assertEqual(clamp_analysis_fields({"platform": "Website"})["reason"],
+                         "No reason provided.")
+
+
+class TestDerivedFields(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import app
+        cls.app = app
+
+    def test_parent_section_and_page_name(self):
+        url = "https://mankato.mnsu.edu/university-life/housing/rates/"
+        self.assertEqual(self.app.url_page_name(url), "Rates")
+        self.assertEqual(self.app.url_parent_section(url), "university-life/housing")
+        self.assertEqual(self.app.url_parent_section("https://mankato.mnsu.edu/housing/"), "/")
+        self.assertEqual(self.app.url_page_name("https://mankato.mnsu.edu/"), "Home")
+
+    def test_platform_fit_follows_treatment(self):
+        def fit(treatment):
+            fields = default_analysis_fields()
+            fields["recommended_treatment"] = treatment
+            return self.app.derive_computed_fields("https://x.edu/a/b/", fields)["current_platform_fit"]
+
+        self.assertEqual(fit("KEEP"), "Appropriate")
+        self.assertEqual(fit("KEEP + IMPROVE"), "Appropriate")
+        self.assertEqual(fit("CONNECT"), "Appropriate")
+        self.assertEqual(fit("EXPERT REVIEW NEEDED"), "Needs Expert Review")
+        self.assertEqual(fit("CONSIDER MOVING"), "Reconsider")
+        self.assertEqual(fit("ARCHIVE / REMOVE REVIEW"), "Reconsider")
+        self.assertEqual(fit(""), "Unable to Determine")
+
+    def test_overall_health_is_the_worst_dimension(self):
+        fields = default_analysis_fields()
+        for dim in HEALTH_DIMENSIONS:
+            fields[dim] = "Strong"
+        fields["health_clarity"] = "Needs Improvement"
+        derived = self.app.derive_computed_fields("https://x.edu/a/b/", fields)
+        self.assertEqual(derived["overall_content_health"], "Needs Improvement")
+
+        fields["health_actionability"] = "Significant Concern"
+        derived = self.app.derive_computed_fields("https://x.edu/a/b/", fields)
+        self.assertEqual(derived["overall_content_health"], "Significant Concern")
+
+    def test_overall_health_unknown_when_no_dimension_rated(self):
+        derived = self.app.derive_computed_fields("https://x.edu/a/b/", default_analysis_fields())
+        self.assertEqual(derived["overall_content_health"], "Unable to Determine")
+
+    def test_flags_track_their_source_fields(self):
+        fields = default_analysis_fields()
+        fields["health_accuracy_currency"] = "Significant Concern"
+        fields["duplication_status"] = "Conflicting content detected"
+        derived = self.app.derive_computed_fields("https://x.edu/a/b/", fields)
+        self.assertTrue(derived["outdated_content_flag"])
+        self.assertTrue(derived["conflicting_content_flag"])
+        self.assertEqual(derived["current_platform"], "Website")
+
+    def test_fallback_returns_the_full_field_set(self):
+        result = self.app.fallback_platform_suggestion(
+            "Tobacco Policy", "https://mankato.mnsu.edu/policy/tobacco/", "smoking policy text")
+        self.assertEqual(result["platform"], "Maverick OneStop")
+        for name in FIELD_ALLOWED_VALUES:
+            self.assertIn(name, result, msg=name)
+        self.assertIn("parent_section", result)
+        self.assertIn("overall_content_health", result)
+        self.assertTrue(result["confidence_gap"])
+
+
+class TestExportSuggestions(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import app
+        cls.app = app
+
+    def _result(self, **overrides):
+        fields = default_analysis_fields()
+        fields.update(index=1, url="https://mankato.mnsu.edu/a/b/", page_name="B",
+                      platform="Website", confidence="High")
+        fields.update(overrides)
+        fields.update(self.app.derive_computed_fields(fields["url"], fields))
+        return fields
+
+    def test_workbook_has_framework_columns(self):
+        import openpyxl
+        path = self.app.export_suggestions([self._result()], "https://mankato.mnsu.edu/a/")
+        try:
+            ws = openpyxl.load_workbook(path)["Platform Suggestions"]
+            headers = [c.value for c in ws[1]]
+            for expected in ("Page Name", "Parent Section", "Primary Audience",
+                             "Overall Content Health", "Duplication Status",
+                             "Recommended Treatment", "AI/Search Readiness",
+                             "Priority", "Questions for Content Owner", "Status"):
+                self.assertIn(expected, headers, msg=expected)
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_derived_columns_agree_with_source_values(self):
+        import openpyxl
+        result = self._result(recommended_treatment="ARCHIVE / REMOVE REVIEW",
+                              health_accuracy_currency="Significant Concern")
+        path = self.app.export_suggestions([result], "https://mankato.mnsu.edu/a/")
+        try:
+            ws = openpyxl.load_workbook(path)["Platform Suggestions"]
+            row = dict(zip([c.value for c in ws[1]], [c.value for c in ws[2]]))
+            self.assertEqual(row["Current Platform Fit"], "Reconsider")
+            self.assertEqual(row["Outdated Content Flag"], "Yes")
+            self.assertEqual(row["Overall Content Health"], "Significant Concern")
+            self.assertEqual(row["Status"], None)
+        finally:
+            path.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
